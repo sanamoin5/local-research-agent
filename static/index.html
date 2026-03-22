@@ -1,0 +1,164 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Research Agent</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #fafafa; }
+    .wrap { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; padding: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; background: #fff; }
+    .hidden { display: none; }
+    .muted { color:#666; font-size:12px; }
+    .warn { color:#9a6700; }
+    .fail { color:#b42318; }
+    .pass { color:#067647; }
+    textarea,input { width:100%; }
+    #activity { white-space: pre-wrap; font-family: monospace; max-height: 220px; overflow:auto; }
+    .step-item { border:1px solid #eee; border-radius:6px; padding:6px; margin:4px 0; }
+  </style>
+</head>
+<body>
+<div id="setupPanel" class="card hidden" style="margin:12px">
+  <h3>Setup & Diagnostics</h3>
+  <div id="healthSummary"></div>
+  <div id="healthChecks"></div>
+  <div style="margin-top:8px">
+    <button id="repairPlaywrightBtn">Repair Playwright</button>
+    <button id="repairModelBtn">Pull Recommended Model</button>
+    <button id="repairDbBtn">Repair DB</button>
+    <button id="resetSettingsBtn">Reset Settings</button>
+    <button id="refreshHealthBtn">Refresh Health</button>
+  </div>
+  <div id="repairStatus" class="muted"></div>
+</div>
+
+<div class="wrap">
+  <div>
+    <div class="card">
+      <h3>New Task</h3>
+      <textarea id="taskInput" placeholder="Research local memory systems"></textarea>
+      <button id="submitBtn">Submit</button>
+      <button id="cancelBtn">Cancel Task</button>
+      <p>Status: <span id="status">idle</span></p>
+      <div id="stateHint" class="muted">No task selected.</div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3>Plan Review</h3>
+      <div id="planView" class="muted">No plan yet.</div>
+      <button id="confirmPlanBtn">Confirm</button>
+      <button id="rejectPlanBtn">Reject</button>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3>Sessions</h3>
+      <div id="history"></div>
+    </div>
+  </div>
+
+  <div>
+    <div id="degradedNote" class="card hidden warn">Degraded mode: some dependencies are missing. Tasks may run with reduced capability.</div>
+    <div class="card"><h3>Activity</h3><div id="activity"></div></div>
+    <div class="card" style="margin-top:12px"><h3>Output</h3><button id="copyMdBtn">Copy markdown</button><button id="downloadMdBtn">Download markdown</button><div id="output"></div></div>
+    <div class="card" style="margin-top:12px"><h3>Sources</h3><div id="sources"></div></div>
+  </div>
+</div>
+
+<script>
+let currentTaskId=null, es=null;
+function setStatus(s){ document.getElementById('status').textContent=s; }
+function log(msg){ const a=document.getElementById('activity'); a.textContent += `• ${msg}\n`; a.scrollTop=a.scrollHeight; }
+function stateHint(msg){ document.getElementById('stateHint').textContent=msg; }
+
+async function refreshHealth(){
+  const h=await (await fetch('/api/health')).json();
+  document.getElementById('healthSummary').textContent = `Overall: ${h.overall_status}`;
+  const checks=document.getElementById('healthChecks'); checks.innerHTML='';
+  h.checks.forEach(c=>{ const d=document.createElement('div'); d.className=`${c.status}`; d.textContent=`${c.name}: ${c.status.toUpperCase()} — ${c.message}`; checks.appendChild(d); });
+
+  const setupNeeded = h.overall_status !== 'healthy';
+  document.getElementById('setupPanel').classList.toggle('hidden', !setupNeeded);
+  document.getElementById('degradedNote').classList.toggle('hidden', h.overall_status === 'healthy');
+}
+
+async function repair(path){
+  const el=document.getElementById('repairStatus');
+  el.textContent='Repair in progress...';
+  const res=await (await fetch(path,{method:'POST'})).json();
+  el.textContent = res.message || JSON.stringify(res);
+  await refreshHealth();
+}
+
+function renderTask(t){
+  setStatus(t.status);
+  document.getElementById('planView').textContent = t.plan ? `Goal: ${t.plan.goal}\n` + t.plan.steps.map(s=>`${s.step_number}. ${s.description}`).join('\n') : 'No plan';
+  document.getElementById('output').textContent = t.output_markdown || '';
+
+  if(t.status==='failed') stateHint('Task failed. Check activity/logs for details.');
+  else if(t.status==='cancelled') stateHint('Task cancelled. Partial history is preserved.');
+  else if(t.status==='completed') stateHint('Task completed.');
+  else if(t.status==='planning') stateHint('Waiting for plan confirmation.');
+  else if(t.status==='running') stateHint('Task is running...');
+
+  const sbox=document.getElementById('sources'); sbox.innerHTML='';
+  if(!(t.sources||[]).length){ sbox.innerHTML='<div class="muted">No sources yet.</div>'; }
+  (t.sources||[]).forEach(s=>{
+    const d=document.createElement('div'); d.className='step-item';
+    const state=s.extraction_status==='ok'?'usable':'skipped';
+    d.innerHTML=`<a href="${s.url}" target="_blank">${s.title||s.url}</a><div class="muted">${state} | ${s.quality||'unknown'} | ${s.extraction_method||'n/a'} | ${s.error_reason||'ok'}</div>`;
+    sbox.appendChild(d);
+  });
+}
+
+async function loadTask(id){
+  const t=await (await fetch(`/api/tasks/${id}`)).json();
+  currentTaskId=id; renderTask(t);
+}
+
+async function loadHistory(){
+  const items=await (await fetch('/api/tasks')).json();
+  const box=document.getElementById('history'); box.innerHTML='';
+  if(!items.length){ box.innerHTML='<div class="muted">No sessions yet.</div>'; return; }
+  items.forEach(i=>{ const b=document.createElement('button'); b.style.width='100%'; b.textContent=`${i.status} | conflicts:${i.conflict_count||0} | ${i.input_text.slice(0,45)}`; b.onclick=()=>loadTask(i.id); box.appendChild(b); });
+}
+
+function attachEvents(id){
+  if(es) es.close();
+  es=new EventSource(`/api/tasks/${id}/events`);
+  ['plan_created','plan_waiting_confirmation','plan_confirmed','fallback_triggered','warning','error','step_started','output_ready','source_skipped'].forEach(name=>{
+    es.addEventListener(name,e=>{
+      const d=JSON.parse(e.data);
+      if(d.message) log(d.message); else log(`${name}`);
+      if(name==='output_ready'){ loadTask(id); loadHistory(); }
+      if(name==='error'){ stateHint('Task hit a terminal error.'); }
+    });
+  });
+}
+
+document.getElementById('submitBtn').onclick=async()=>{
+  const task=document.getElementById('taskInput').value;
+  const res=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task})});
+  if(!res.ok){ alert('Task submit failed'); return; }
+  const d=await res.json();
+  currentTaskId=d.task_id; setStatus(d.status); document.getElementById('planView').textContent = `Goal: ${d.plan.goal}\n` + d.plan.steps.map(s=>`${s.step_number}. ${s.description}`).join('\n');
+  attachEvents(d.task_id); loadHistory(); stateHint('Waiting for plan confirmation.');
+};
+
+document.getElementById('confirmPlanBtn').onclick=async()=>{ if(currentTaskId) await fetch(`/api/tasks/${currentTaskId}/confirm`,{method:'POST'}); };
+document.getElementById('rejectPlanBtn').onclick=async()=>{ if(currentTaskId){ await fetch(`/api/tasks/${currentTaskId}/reject`,{method:'POST'}); setStatus('cancelled'); stateHint('Task cancelled before execution.'); } };
+document.getElementById('cancelBtn').onclick=async()=>{ if(currentTaskId){ await fetch(`/api/tasks/${currentTaskId}/cancel`,{method:'POST'}); setStatus('cancelled'); stateHint('Task cancelled.'); } };
+
+document.getElementById('copyMdBtn').onclick=async()=>{ await navigator.clipboard.writeText(document.getElementById('output').textContent||''); alert('Copied'); };
+document.getElementById('downloadMdBtn').onclick=()=>{ const txt=document.getElementById('output').textContent||''; const a=document.createElement('a'); const b=new Blob([txt],{type:'text/markdown'}); a.href=URL.createObjectURL(b); a.download=`task_${currentTaskId||'report'}.md`; a.click(); URL.revokeObjectURL(a.href); };
+
+document.getElementById('repairPlaywrightBtn').onclick=()=>repair('/api/repair/playwright');
+document.getElementById('repairModelBtn').onclick=()=>repair('/api/repair/model');
+document.getElementById('repairDbBtn').onclick=()=>repair('/api/repair/db');
+document.getElementById('resetSettingsBtn').onclick=()=>repair('/api/repair/settings/reset');
+document.getElementById('refreshHealthBtn').onclick=refreshHealth;
+
+refreshHealth();
+loadHistory();
+</script>
+</body>
+</html>
