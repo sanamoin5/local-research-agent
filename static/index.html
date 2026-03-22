@@ -1,0 +1,259 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local Research Agent</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --border: #e5e7eb;
+      --text: #111827;
+      --muted: #6b7280;
+      --primary: #2563eb;
+      --warn: #92400e;
+      --success: #065f46;
+      --danger: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    .topbar { background: #0f172a; color: #fff; padding: 12px 16px; font-weight: 600; }
+    .container { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 14px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+    .title { margin: 0 0 10px; font-size: 20px; }
+    .subtle { color: var(--muted); font-size: 13px; }
+    .hidden { display: none; }
+
+    textarea, input { width: 100%; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 14px; }
+    textarea { min-height: 76px; resize: vertical; }
+    button { border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; background: #fff; cursor: pointer; }
+    button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    button + button { margin-left: 8px; }
+
+    .setup-check { font-size: 14px; margin: 5px 0; }
+    .setup-check.pass { color: var(--success); }
+    .setup-check.warn { color: var(--warn); }
+    .setup-check.fail { color: var(--danger); }
+
+    .main-col { display: grid; gap: 14px; }
+    .chat-shell { display: grid; grid-template-rows: auto 1fr auto; min-height: 520px; }
+    .chat-stream { border: 1px solid var(--border); border-radius: 12px; background: #fbfcff; padding: 10px; max-height: 350px; overflow: auto; }
+    .bubble { max-width: 88%; margin: 8px 0; padding: 10px 12px; border-radius: 12px; font-size: 14px; line-height: 1.35; }
+    .bubble.system { background: #eef2ff; border: 1px solid #dbeafe; }
+    .bubble.warn { background: #fff7ed; border: 1px solid #fed7aa; }
+    .bubble.error { background: #fef2f2; border: 1px solid #fecaca; }
+
+    .panel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .source-card { border: 1px solid var(--border); border-radius: 10px; padding: 8px; margin: 6px 0; }
+
+    .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+    .badge.degraded { background: #fff7ed; color: var(--warn); }
+    .badge.ready { background: #ecfdf5; color: var(--success); }
+
+    .help-list { margin: 8px 0 0; padding-left: 18px; }
+    .help-list li { margin: 4px 0; font-size: 13px; color: var(--muted); }
+
+    @media (max-width: 1100px) {
+      .container { grid-template-columns: 1fr; }
+      .panel-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">Local Research Agent</div>
+
+  <div class="container">
+    <div>
+      <div class="card">
+        <h3 class="title" style="font-size:18px">Before You Start</h3>
+        <div class="subtle">What you need and where to get it.</div>
+        <ul class="help-list">
+          <li><b>Ollama</b>: install from <a href="https://ollama.com/download" target="_blank">ollama.com/download</a>.</li>
+          <li><b>Model</b>: run <code>ollama pull llama3.1:8b</code> (or use the “Pull Recommended Model” button below).</li>
+          <li><b>Tavily key</b> (optional, recommended): create at <a href="https://app.tavily.com/" target="_blank">app.tavily.com</a> and set <code>TAVILY_API_KEY</code>.</li>
+          <li><b>Playwright Chromium</b>: install via <code>python -m playwright install chromium</code> (or use repair button).</li>
+        </ul>
+      </div>
+
+      <div id="setupPanel" class="card" style="margin-top:12px;">
+        <h3 class="title" style="font-size:18px">Setup & Diagnostics <span id="overallBadge" class="badge">checking...</span></h3>
+        <div id="healthChecks"></div>
+        <div style="margin-top:8px">
+          <button id="repairPlaywrightBtn">Repair Playwright</button>
+          <button id="repairModelBtn">Pull Recommended Model</button>
+          <button id="repairDbBtn">Repair DB</button>
+          <button id="resetSettingsBtn">Reset Settings</button>
+          <button id="refreshHealthBtn">Refresh Health</button>
+        </div>
+        <div id="repairStatus" class="subtle" style="margin-top:6px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h3 class="title" style="font-size:18px">Task</h3>
+        <textarea id="taskInput" placeholder="Research local memory systems for autonomous agents"></textarea>
+        <div style="margin-top:8px">
+          <button id="submitBtn" class="primary">Submit</button>
+          <button id="cancelBtn">Cancel Task</button>
+        </div>
+        <p style="margin:10px 0 0"><b>Status:</b> <span id="status">idle</span></p>
+        <div id="stateHint" class="subtle">No task selected.</div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h3 class="title" style="font-size:18px">Plan Review</h3>
+        <pre id="planView" class="subtle" style="white-space:pre-wrap; margin:0 0 10px;">No plan yet.</pre>
+        <button id="confirmPlanBtn">Confirm</button>
+        <button id="rejectPlanBtn">Reject</button>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h3 class="title" style="font-size:18px">Sessions</h3>
+        <div id="history" class="subtle">Loading...</div>
+      </div>
+    </div>
+
+    <div class="main-col">
+      <div class="card chat-shell">
+        <div style="display:flex;justify-content:space-between;align-items:center; margin-bottom:8px;">
+          <h3 class="title" style="font-size:18px; margin:0;">Activity</h3>
+          <span id="degradedNote" class="badge hidden">Degraded mode</span>
+        </div>
+        <div id="activity" class="chat-stream"></div>
+      </div>
+
+      <div class="panel-grid">
+        <div class="card">
+          <h3 class="title" style="font-size:18px">Output</h3>
+          <button id="copyMdBtn">Copy markdown</button>
+          <button id="downloadMdBtn">Download markdown</button>
+          <pre id="output" style="white-space:pre-wrap; margin-top:10px; max-height:350px; overflow:auto;"></pre>
+        </div>
+
+        <div class="card">
+          <h3 class="title" style="font-size:18px">Sources</h3>
+          <div id="sources" class="subtle">No sources yet.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+let currentTaskId=null, es=null;
+
+function setStatus(s){ document.getElementById('status').textContent=s; }
+function stateHint(msg){ document.getElementById('stateHint').textContent=msg; }
+function addBubble(msg,type='system'){
+  const box=document.getElementById('activity');
+  const d=document.createElement('div'); d.className=`bubble ${type}`; d.textContent=msg; box.appendChild(d); box.scrollTop=box.scrollHeight;
+}
+
+async function refreshHealth(){
+  const h=await (await fetch('/api/health')).json();
+  const badge=document.getElementById('overallBadge');
+  badge.textContent=h.overall_status;
+  badge.className=`badge ${h.overall_status==='healthy'?'ready':'degraded'}`;
+  document.getElementById('degradedNote').classList.toggle('hidden', h.overall_status==='healthy');
+
+  const checks=document.getElementById('healthChecks'); checks.innerHTML='';
+  h.checks.forEach(c=>{
+    const d=document.createElement('div');
+    d.className=`setup-check ${c.status}`;
+    d.textContent=`${c.name}: ${c.status.toUpperCase()} — ${c.message}`;
+    checks.appendChild(d);
+  });
+}
+
+async function repair(path){
+  const el=document.getElementById('repairStatus');
+  el.textContent='Running repair...';
+  const out=await (await fetch(path,{method:'POST'})).json();
+  el.textContent=out.message || JSON.stringify(out);
+  addBubble(out.message || 'Repair action finished', out.ok===false?'warn':'system');
+  await refreshHealth();
+}
+
+function renderTask(t){
+  setStatus(t.status);
+  document.getElementById('planView').textContent = t.plan ? `Goal: ${t.plan.goal}\n` + t.plan.steps.map(s=>`${s.step_number}. ${s.description}`).join('\n') : 'No plan';
+  document.getElementById('output').textContent=t.output_markdown || '';
+
+  if(t.status==='failed') stateHint('Task failed. Open diagnostics above and try again.');
+  else if(t.status==='cancelled') stateHint('Task cancelled. Completed steps are preserved.');
+  else if(t.status==='completed') stateHint('Task completed successfully.');
+  else if(t.status==='planning') stateHint('Plan ready. Confirm to start execution.');
+  else if(t.status==='running') stateHint('Task is running...');
+
+  const sbox=document.getElementById('sources'); sbox.innerHTML='';
+  if(!(t.sources||[]).length){ sbox.textContent='No sources yet.'; return; }
+  (t.sources||[]).forEach(s=>{
+    const state=s.extraction_status==='ok'?'usable':'skipped';
+    const card=document.createElement('div'); card.className='source-card';
+    card.innerHTML=`<a href="${s.url}" target="_blank">${s.title||s.url}</a><div class="subtle">${state} | quality:${s.quality||'unknown'} | method:${s.extraction_method||'n/a'} | ${s.error_reason||'ok'}</div>`;
+    sbox.appendChild(card);
+  });
+}
+
+async function loadTask(id){
+  const t=await (await fetch(`/api/tasks/${id}`)).json();
+  currentTaskId=id; renderTask(t);
+}
+
+async function loadHistory(){
+  const items=await (await fetch('/api/tasks')).json();
+  const box=document.getElementById('history'); box.innerHTML='';
+  if(!items.length){ box.textContent='No sessions yet.'; return; }
+  items.forEach(i=>{
+    const b=document.createElement('button'); b.style.width='100%'; b.style.margin='4px 0';
+    b.textContent=`${i.status} | conflicts:${i.conflict_count||0} | ${i.input_text.slice(0,40)}`;
+    b.onclick=()=>loadTask(i.id);
+    box.appendChild(b);
+  });
+}
+
+function attachEvents(id){
+  if(es) es.close();
+  es=new EventSource(`/api/tasks/${id}/events`);
+  ['plan_created','plan_waiting_confirmation','plan_confirmed','fallback_triggered','warning','error','step_started','output_ready','source_skipped','source_found'].forEach(name=>{
+    es.addEventListener(name,e=>{
+      const d=JSON.parse(e.data);
+      if(d.message) addBubble(d.message, name==='error'?'error':(name==='warning'?'warn':'system'));
+      else addBubble(name, 'system');
+      if(name==='output_ready'){ loadTask(id); loadHistory(); }
+      if(name==='error'){ stateHint('Task hit a terminal error.'); }
+    });
+  });
+}
+
+document.getElementById('submitBtn').onclick=async()=>{
+  const task=document.getElementById('taskInput').value;
+  const res=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task})});
+  if(!res.ok){ addBubble('Task submit failed', 'error'); return; }
+  const d=await res.json();
+  currentTaskId=d.task_id;
+  setStatus(d.status);
+  document.getElementById('planView').textContent=`Goal: ${d.plan.goal}\n` + d.plan.steps.map(s=>`${s.step_number}. ${s.description}`).join('\n');
+  attachEvents(d.task_id);
+  loadHistory();
+  stateHint('Plan generated. Confirm to run.');
+  addBubble('Plan created. Review and confirm when ready.');
+};
+
+document.getElementById('confirmPlanBtn').onclick=async()=>{ if(currentTaskId) await fetch(`/api/tasks/${currentTaskId}/confirm`,{method:'POST'}); };
+document.getElementById('rejectPlanBtn').onclick=async()=>{ if(currentTaskId){ await fetch(`/api/tasks/${currentTaskId}/reject`,{method:'POST'}); setStatus('cancelled'); stateHint('Task cancelled before execution.'); } };
+document.getElementById('cancelBtn').onclick=async()=>{ if(currentTaskId){ await fetch(`/api/tasks/${currentTaskId}/cancel`,{method:'POST'}); setStatus('cancelled'); stateHint('Task cancelled.'); } };
+
+document.getElementById('copyMdBtn').onclick=async()=>{ await navigator.clipboard.writeText(document.getElementById('output').textContent||''); addBubble('Markdown copied to clipboard.'); };
+document.getElementById('downloadMdBtn').onclick=()=>{ const txt=document.getElementById('output').textContent||''; const a=document.createElement('a'); const b=new Blob([txt],{type:'text/markdown'}); a.href=URL.createObjectURL(b); a.download=`task_${currentTaskId||'report'}.md`; a.click(); URL.revokeObjectURL(a.href); };
+
+document.getElementById('repairPlaywrightBtn').onclick=()=>repair('/api/repair/playwright');
+document.getElementById('repairModelBtn').onclick=()=>repair('/api/repair/model');
+document.getElementById('repairDbBtn').onclick=()=>repair('/api/repair/db');
+document.getElementById('resetSettingsBtn').onclick=()=>repair('/api/repair/settings/reset');
+document.getElementById('refreshHealthBtn').onclick=refreshHealth;
+
+refreshHealth();
+loadHistory();
+</script>
+</body>
+</html>
