@@ -175,36 +175,6 @@ Use environment variables:
 
 ---
 
-
-## Prerequisites (what to install and where)
-
-1. **Python 3.11+**
-   - Download: https://www.python.org/downloads/
-2. **Ollama** (required for local model execution)
-   - Download: https://ollama.com/download
-3. **(Optional but recommended) Tavily API key** for search
-   - Create account/key: https://app.tavily.com/
-4. **Playwright Chromium** (for browser fallback)
-   - Install command: `python -m playwright install chromium`
-
-### Model install / change / location
-
-- Install recommended model:
-  ```bash
-  ollama pull llama3.1:8b
-  ```
-- See installed models:
-  ```bash
-  ollama list
-  ```
-- Change recommended model for this app:
-  - Set env var `RECOMMENDED_MODEL=<your_model_name>`
-  - Example: `RECOMMENDED_MODEL=qwen2.5:7b`
-
-Common Ollama model storage paths:
-- macOS/Linux: `~/.ollama/models`
-- Windows: `%USERPROFILE%\.ollama\models`
-
 ## API reference
 
 ### Tasks
