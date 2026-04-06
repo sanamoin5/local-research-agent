@@ -26,8 +26,9 @@ class PlanStep(BaseModel):
 
 
 class TaskPlan(BaseModel):
-    goal: str = Field(min_length=3, max_length=280)
-    steps: list[PlanStep] = Field(min_length=3, max_length=6)
+    goal: str = Field(min_length=3, max_length=400)
+    success_criteria: list[str] = Field(default_factory=list)
+    steps: list[PlanStep] = Field(min_length=1, max_length=12)
 
     @field_validator("steps")
     @classmethod
@@ -42,23 +43,37 @@ class TaskPlan(BaseModel):
 class SettingsUpdate(BaseModel):
     max_steps: int | None = Field(default=None, ge=1, le=30)
     max_pages_per_query: int | None = Field(default=None, ge=1, le=20)
-    max_total_runtime_sec: int | None = Field(default=None, ge=30, le=3600)
+    max_total_runtime_sec: int | None = Field(default=None, ge=30, le=36000)
+    max_iterations: int | None = Field(default=None, ge=1, le=50)
     fetch_timeout_sec: int | None = Field(default=None, ge=1, le=120)
     max_page_size_bytes: int | None = Field(default=None, ge=50_000, le=10_000_000)
     model_name: str | None = Field(default=None, min_length=1, max_length=200)
-    search_provider: Literal["tavily"] | None = None
+    search_provider: Literal["duckduckgo"] | None = None
     cache_enabled: bool | None = None
+    reasoning_temperature: float | None = Field(default=None, ge=0.0, le=1.0)
+    synthesis_temperature: float | None = Field(default=None, ge=0.0, le=1.0)
+    synthesis_max_tokens: int | None = Field(default=None, ge=512, le=32768)
+    top_sources_cap: int | None = Field(default=None, ge=1, le=30)
+    inter_query_delay: float | None = Field(default=None, ge=0.0, le=30.0)
+    inter_iteration_cooldown: float | None = Field(default=None, ge=0.0, le=60.0)
 
 
 class Settings(BaseModel):
     max_steps: int = 12
     max_pages_per_query: int = 5
-    max_total_runtime_sec: int = 300
+    max_total_runtime_sec: int = 36000
+    max_iterations: int = 10
     fetch_timeout_sec: int = 10
     max_page_size_bytes: int = 2 * 1024 * 1024
     model_name: str = "llama3.1:8b"
-    search_provider: Literal["tavily"] = "tavily"
+    search_provider: Literal["duckduckgo"] = "duckduckgo"
     cache_enabled: bool = True
+    reasoning_temperature: float = 0.4
+    synthesis_temperature: float = 0.4
+    synthesis_max_tokens: int = 8192
+    top_sources_cap: int = 9
+    inter_query_delay: float = 4.0
+    inter_iteration_cooldown: float = 5.0
 
 
 class Event(BaseModel):
@@ -75,3 +90,7 @@ class ToolCall(BaseModel):
 class StopDecision(BaseModel):
     should_stop: bool
     reason: str
+
+
+class ModelAction(BaseModel):
+    model_name: str = Field(min_length=1, max_length=200)

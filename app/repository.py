@@ -105,6 +105,16 @@ class Repository:
                     value_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS task_traces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    trace_type TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    detail TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS url_cache (
                     normalized_url TEXT PRIMARY KEY,
                     original_url TEXT,
@@ -160,7 +170,25 @@ class Repository:
     def get_settings(self) -> Settings:
         with closing(self.conn()) as conn:
             row = conn.execute("SELECT value_json FROM settings WHERE key='runtime'").fetchone()
-        return Settings(**json.loads(row["value_json"])) if row else Settings()
+        if not row:
+            return Settings()
+        try:
+            loaded = Settings(**json.loads(row["value_json"]))
+        except Exception:
+            return self.reset_settings()
+        # Auto-migrate: old DB rows may have a very low runtime (e.g. legacy 600s default).
+        # Silently bump to the current code default so users aren't surprised by quick timeouts.
+        if loaded.max_total_runtime_sec < 3600:
+            data = loaded.model_dump()
+            data["max_total_runtime_sec"] = Settings.model_fields["max_total_runtime_sec"].default
+            loaded = Settings(**data)
+            with closing(self.conn()) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings(key,value_json) VALUES('runtime',?)",
+                    (loaded.model_dump_json(),),
+                )
+                conn.commit()
+        return loaded
 
     def update_settings(self, patch: dict[str, Any]) -> Settings:
         current = self.get_settings().model_dump()
@@ -306,6 +334,12 @@ class Repository:
             )
             conn.commit()
 
+    def list_sources(self, task_id: str) -> list[dict[str, Any]]:
+        with closing(self.conn()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM sources WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
+            return [dict(r) for r in rows]
+
     def list_tasks(self) -> list[dict[str, Any]]:
         with closing(self.conn()) as conn:
             rows = conn.execute(
@@ -330,6 +364,22 @@ class Repository:
         out["sources"] = [dict(s) for s in sources]
         return out
 
+
+    def add_trace(self, task_id: str, trace_type: str, label: str, detail: str = "") -> None:
+        with closing(self.conn()) as conn:
+            conn.execute(
+                "INSERT INTO task_traces(task_id, trace_type, label, detail, created_at) VALUES(?,?,?,?,?)",
+                (task_id, trace_type, label, detail[:5000], utc_now()),
+            )
+            conn.commit()
+
+    def list_traces(self, task_id: str) -> list[dict[str, Any]]:
+        with closing(self.conn()) as conn:
+            rows = conn.execute(
+                "SELECT trace_type, label, detail, created_at FROM task_traces WHERE task_id=? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def request_cancel(self, task_id: str) -> None:
         with closing(self.conn()) as conn:

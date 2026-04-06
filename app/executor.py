@@ -55,7 +55,6 @@ class AgentExecutor:
             task_id=task_id,
             task_text=task["input_text"],
             settings=settings,
-            tavily_api_key=self.config.tavily_api_key,
             ollama_base_url=self.config.ollama_base_url,
             collected_sources=[],
         )
@@ -64,6 +63,9 @@ class AgentExecutor:
         step_idx = 1
         retries = 0
         state: dict[str, Any] = {"queries": [], "candidates": [], "fetched": 0, "usable_sources": 0}
+
+        async def _trace(tt: str, label: str, detail: str = "") -> None:
+            await self.bus.emit(task_id, "trace", {"trace_type": tt, "label": label, "detail": detail[:1200]})
 
         while step_idx <= settings.max_steps:
             latest = self.repo.get_task(task_id)
@@ -74,24 +76,33 @@ class AgentExecutor:
 
             elapsed = int((datetime.now(timezone.utc) - start).total_seconds())
             if elapsed >= settings.max_total_runtime_sec:
+                await _trace("warning", f"Time limit reached ({elapsed}s / {settings.max_total_runtime_sec}s)")
                 break
 
+            await _trace("model_call", f"Step {step_idx}: model deciding next action", f"Model: {settings.model_name}\nState: fetched={state['fetched']}, usable={state['usable_sources']}, queries={len(state['queries'])}\nElapsed: {elapsed}s")
             try:
                 call = await self._choose_tool_call(task["input_text"], plan, state, settings, constrained=False)
             except Exception:
                 retries += 1
+                await _trace("warning", f"Model response parse failed (attempt {retries})", "Response was not valid JSON tool call, retrying with constrained tool set")
                 self.repo.add_step(task_id, step_idx, "agent_parse", "failed", datetime.now(timezone.utc), "Tool call parse failed; constrained retry", {"retry": retries})
                 if retries > 1:
+                    await _trace("error", "Falling back to direct pipeline", "Model failed to produce valid tool calls twice")
                     return {"status": "fallback", "reason": "tool_call_parse_failed"}
                 try:
                     call = await self._choose_tool_call(task["input_text"], plan, state, settings, constrained=True)
                 except Exception:
+                    await _trace("error", "Falling back to direct pipeline", "Constrained retry also failed")
                     return {"status": "fallback", "reason": "tool_call_parse_failed_twice"}
 
+            await _trace("tool_decision", f"Model chose: {call.tool_name}", f"Reasoning: {call.reasoning}\nInput: {json.dumps(call.tool_input, indent=2)}")
             await self.bus.emit(task_id, "step_started", {"step": call.tool_name, "message": call.reasoning or f"Running {call.tool_name}"})
             started = datetime.now(timezone.utc)
             try:
                 output = await router.run(call)
+                duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                out_summary = json.dumps(output, indent=2)[:600]
+                await _trace("tool_result", f"{call.tool_name} completed ({duration_ms}ms)", out_summary)
                 self.repo.add_step(
                     task_id,
                     step_idx,
@@ -106,6 +117,7 @@ class AgentExecutor:
                     tool_output=output,
                 )
             except Exception as exc:
+                await _trace("error", f"Tool failed: {call.tool_name}", f"Exception: {exc.__class__.__name__}: {str(exc)[:200]}")
                 self.repo.add_step(
                     task_id,
                     step_idx,
@@ -144,7 +156,7 @@ class AgentExecutor:
                             "content_text": output.get("content_text"),
                             "content_type": output.get("content_type"),
                             "content_length_bytes": output.get("content_length_bytes"),
-                            "provider": "tavily",
+                            "provider": "duckduckgo",
                             "cache_hit": False,
                         },
                     )
@@ -159,7 +171,7 @@ class AgentExecutor:
                             "extraction_status": "skipped",
                             "quality": "poor",
                             "error_reason": output.get("reason", "fetch_failed"),
-                            "provider": "tavily",
+                            "provider": "duckduckgo",
                             "cache_hit": False,
                         },
                     )
@@ -178,8 +190,10 @@ class AgentExecutor:
                 break
             step_idx += 1
 
+        await _trace("analysis", "Analyzing source conflicts", f"Comparing {len(ctx.collected_sources)} sources")
         await self.bus.emit(task_id, "conflict_analysis_started", {"message": "Analyzing source conflicts"})
         conflicts = detect_conflicts(ctx.collected_sources)
+        await _trace("analysis", f"Conflict analysis: {len(conflicts)} found", "\n".join(f"  {c['topic']}: {c['description'][:80]}" for c in conflicts) if conflicts else "No conflicts")
         await self.bus.emit(task_id, "conflict_analysis_completed", {"conflict_count": len(conflicts)})
 
         skipped = max(0, len(state.get("candidates", [])) - len(ctx.collected_sources))
@@ -192,6 +206,7 @@ class AgentExecutor:
             domain_count=domains,
         )
 
+        await _trace("model_call", "Generating final report", f"Model: {settings.model_name}\nSources: {len(ctx.collected_sources)}\nConflicts: {len(conflicts)}")
         await self.bus.emit(task_id, "final_synthesis_started", {"message": "Generating final structured report"})
         structured, synthesis_mode = await generate_structured_report(
             task_text=task["input_text"],
@@ -212,6 +227,7 @@ class AgentExecutor:
             started_at=task.get("started_at"),
         )
         meta["synthesis_mode"] = synthesis_mode
+        await _trace("model_result", f"Report ready ({synthesis_mode})", f"Summary: {structured.summary[:200]}\nFindings: {len(structured.findings)}\nSources: {len(structured.sources)}")
 
         self.repo.store_report(
             task_id,

@@ -3,7 +3,7 @@ from typing import Any
 
 from .repository import Repository
 from .schemas import Settings, StopDecision, ToolCall
-from .services import extract_content, fetch_http, generate_queries, normalize_url, tavily_search
+from .services import extract_content, fetch_http, generate_queries, normalize_url, web_search
 
 
 @dataclass
@@ -12,7 +12,6 @@ class ToolContext:
     task_id: str
     task_text: str
     settings: Settings
-    tavily_api_key: str
     ollama_base_url: str
     collected_sources: list[dict[str, Any]]
 
@@ -24,7 +23,7 @@ class ToolRouter:
     async def run(self, call: ToolCall) -> dict[str, Any]:
         if call.tool_name == "search_web":
             query = str(call.tool_input.get("query", self.ctx.task_text))
-            rows = await tavily_search(self.ctx.tavily_api_key, query, self.ctx.settings.max_pages_per_query)
+            rows = await web_search(query, self.ctx.settings.max_pages_per_query)
             unique = {}
             for row in rows:
                 if not row.get("url"):

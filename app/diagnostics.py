@@ -24,7 +24,7 @@ def overall_status(checks: list[CheckResult]) -> str:
     return "healthy"
 
 
-async def run_diagnostics(repo: Repository, ollama_base_url: str, tavily_api_key: str, recommended_model: str) -> dict[str, Any]:
+async def run_diagnostics(repo: Repository, ollama_base_url: str, recommended_model: str) -> dict[str, Any]:
     checks: list[CheckResult] = []
     repair_actions: list[str] = []
 
@@ -72,10 +72,14 @@ async def run_diagnostics(repo: Repository, ollama_base_url: str, tavily_api_key
         checks.append(CheckResult("playwright", "fail", "Playwright Chromium likely missing"))
         repair_actions.append("install_playwright")
 
-    if tavily_api_key:
-        checks.append(CheckResult("search_provider", "pass", "Tavily configured"))
-    else:
-        checks.append(CheckResult("search_provider", "warn", "Tavily key missing; search may fail"))
+    try:
+        from .services import DDGS
+        if DDGS is not None:
+            checks.append(CheckResult("search_provider", "pass", "DuckDuckGo search active"))
+        else:
+            checks.append(CheckResult("search_provider", "fail", "duckduckgo-search package not installed"))
+    except Exception:
+        checks.append(CheckResult("search_provider", "fail", "Search provider unavailable"))
 
     try:
         repo.get_settings()

@@ -1,164 +1,1425 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Local Research Agent</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
-    body { font-family: Arial, sans-serif; margin: 0; background: #fafafa; }
-    .wrap { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; padding: 12px; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; background: #fff; }
-    .hidden { display: none; }
-    .muted { color:#666; font-size:12px; }
-    .warn { color:#9a6700; }
-    .fail { color:#b42318; }
-    .pass { color:#067647; }
-    textarea,input { width:100%; }
-    #activity { white-space: pre-wrap; font-family: monospace; max-height: 220px; overflow:auto; }
-    .step-item { border:1px solid #eee; border-radius:6px; padding:6px; margin:4px 0; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-primary: #0e1116;
+      --bg-secondary: #161b22;
+      --bg-tertiary: #1c2129;
+      --bg-input: #0d1117;
+      --border: #2a313a;
+      --border-focus: #4a8eff;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --text-muted: #6e7681;
+      --accent: #4a8eff;
+      --accent-hover: #5c9aff;
+      --green: #3fb950;
+      --yellow: #d29922;
+      --red: #f85149;
+      --radius: 8px;
+      --radius-sm: 6px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* Top bar */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-secondary);
+    }
+    .topbar-title {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .topbar-right { display: flex; align-items: center; gap: 12px; }
+    .health-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .health-dot.healthy { background: var(--green); }
+    .health-dot.degraded { background: var(--yellow); }
+    .health-dot.setup_required { background: var(--red); }
+    .topbar-status {
+      font-size: 12px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .topbar-status:hover { color: var(--text-primary); }
+
+    /* Setup panel */
+    .setup-banner {
+      margin: 16px 24px 0;
+      padding: 16px 20px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    .setup-banner.hidden { display: none; }
+    .setup-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .setup-header h3 {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .setup-checks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 16px;
+      margin-bottom: 14px;
+    }
+    .check-item {
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .check-icon { font-size: 11px; }
+    .check-item.pass .check-icon { color: var(--green); }
+    .check-item.warn .check-icon { color: var(--yellow); }
+    .check-item.fail .check-icon { color: var(--red); }
+    .setup-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .setup-actions button { font-size: 11px; padding: 5px 10px; }
+    #repairStatus { margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
+
+    /* Layout */
+    .layout {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 0;
+      min-height: calc(100vh - 49px);
+    }
+    .sidebar {
+      border-right: 1px solid var(--border);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      overflow-y: auto;
+    }
+    .main {
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      overflow-y: auto;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+    .card-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      margin-bottom: 10px;
+    }
+
+    /* Forms */
+    textarea {
+      width: 100%;
+      min-height: 80px;
+      padding: 10px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 13px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 2px rgba(74, 142, 255, 0.15);
+    }
+    textarea::placeholder { color: var(--text-muted); }
+
+    /* Buttons */
+    button {
+      padding: 7px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button:hover {
+      background: #282e36;
+      border-color: #3d444d;
+    }
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 500;
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+    .btn-confirm {
+      background: rgba(63, 185, 80, 0.15);
+      border-color: rgba(63, 185, 80, 0.3);
+      color: var(--green);
+    }
+    .btn-confirm:hover {
+      background: rgba(63, 185, 80, 0.25);
+    }
+    .btn-danger {
+      background: rgba(248, 81, 73, 0.1);
+      border-color: rgba(248, 81, 73, 0.25);
+      color: var(--red);
+    }
+    .btn-danger:hover {
+      background: rgba(248, 81, 73, 0.2);
+    }
+    .btn-ghost {
+      background: transparent;
+      border-color: transparent;
+      color: var(--text-secondary);
+      padding: 5px 8px;
+      font-size: 12px;
+    }
+    .btn-ghost:hover {
+      color: var(--text-primary);
+      background: var(--bg-tertiary);
+    }
+    .btn-row { display: flex; gap: 8px; margin-top: 10px; }
+
+    /* Status badge */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .badge-idle { background: var(--bg-tertiary); color: var(--text-muted); }
+    .badge-planning { background: rgba(74, 142, 255, 0.15); color: var(--accent); }
+    .badge-running { background: rgba(210, 153, 34, 0.15); color: var(--yellow); }
+    .badge-completed { background: rgba(63, 185, 80, 0.12); color: var(--green); }
+    .badge-failed { background: rgba(248, 81, 73, 0.12); color: var(--red); }
+    .badge-cancelled { background: var(--bg-tertiary); color: var(--text-muted); }
+
+    /* Task status row */
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 10px;
+    }
+    .state-hint {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* Plan view */
+    .plan-content {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.7;
+    }
+    .plan-goal {
+      color: var(--text-primary);
+      font-weight: 500;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+    .plan-step {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 2px 0;
+    }
+    .plan-step-num {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 600;
+      min-width: 18px;
+    }
+    .plan-empty { color: var(--text-muted); font-size: 13px; }
+    .plan-actions { margin-top: 12px; }
+
+    /* History list */
+    .history-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.12s;
+      border: none;
+      background: transparent;
+      color: var(--text-primary);
+      width: 100%;
+      text-align: left;
+    }
+    .history-item:hover { background: var(--bg-tertiary); border-color: transparent; }
+    .history-item.active { background: var(--bg-tertiary); }
+    .history-text {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+    }
+    .history-empty { color: var(--text-muted); font-size: 13px; }
+
+    /* Trace panel */
+    .trace-container {
+      max-height: 600px;
+      overflow-y: auto;
+      padding: 4px 0;
+    }
+    .trace-item {
+      position: relative;
+      padding: 6px 10px 6px 20px;
+      margin-bottom: 1px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+    .trace-item:hover { background: var(--bg-tertiary); }
+    .trace-item::before {
+      content: '';
+      position: absolute;
+      left: 6px;
+      top: 12px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .trace-item::after {
+      content: '';
+      position: absolute;
+      left: 8px;
+      top: 20px;
+      bottom: -3px;
+      width: 1px;
+      background: var(--border);
+    }
+    .trace-item:last-child::after { display: none; }
+    .trace-item.t-model_call::before { background: var(--accent); }
+    .trace-item.t-model_result::before { background: #58a6ff; }
+    .trace-item.t-search::before { background: var(--yellow); }
+    .trace-item.t-search_result::before { background: #c9982a; }
+    .trace-item.t-fetch::before { background: #6e7681; }
+    .trace-item.t-extract::before { background: var(--green); }
+    .trace-item.t-tool_decision::before { background: #bc8cff; }
+    .trace-item.t-tool_result::before { background: #a371f7; }
+    .trace-item.t-analysis::before { background: #39d2c0; }
+    .trace-item.t-synthesis::before { background: #39d2c0; }
+    .trace-item.t-warning::before, .trace-item.t-skip::before { background: var(--yellow); }
+    .trace-item.t-error::before { background: var(--red); }
+    .trace-item.t-info::before { background: var(--text-muted); }
+    .trace-item.t-event::before { background: #6e7681; }
+    .trace-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .trace-label {
+      flex: 1;
+      font-size: 12px;
+      color: var(--text-secondary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .trace-item.t-model_call .trace-label,
+    .trace-item.t-model_result .trace-label { color: var(--accent); }
+    .trace-item.t-warning .trace-label,
+    .trace-item.t-skip .trace-label { color: var(--yellow); }
+    .trace-item.t-error .trace-label { color: var(--red); }
+    .trace-item.t-tool_decision .trace-label { color: #bc8cff; }
+    .trace-time {
+      font-size: 10px;
+      color: var(--text-muted);
+      font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+      flex-shrink: 0;
+    }
+    .trace-expand {
+      font-size: 8px;
+      color: var(--text-muted);
+      transition: transform 0.15s;
+      flex-shrink: 0;
+    }
+    .trace-body {
+      display: none;
+      margin-top: 6px;
+      padding: 8px 10px;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+      font-size: 11px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text-muted);
+      max-height: 350px;
+      overflow-y: auto;
+    }
+    .trace-item.expanded .trace-body { display: block; }
+    .trace-item.expanded .trace-expand { transform: rotate(90deg); }
+    .trace-empty { color: var(--text-muted); font-size: 12px; }
+    .trace-header-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .trace-counter {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+    }
+
+    /* Output */
+    .output-actions {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .output-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 10px;
+    }
+    .output-tab {
+      padding: 6px 16px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      border-bottom: 2px solid transparent;
+      transition: color 0.12s, border-color 0.12s;
+    }
+    .output-tab:hover { color: var(--text-secondary); background: transparent; border-color: transparent; }
+    .output-tab.active { color: var(--accent); border-bottom-color: var(--accent); background: transparent; }
+    .output-panel { display: none; }
+    .output-panel.active { display: block; }
+    .output-content {
+      max-height: 600px;
+      overflow-y: auto;
+      padding: 0 4px;
+      color: var(--text-secondary);
+    }
+    .output-content.rendered h1 { font-size: 20px; font-weight: 700; color: var(--text-primary); margin: 0 0 12px 0; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+    .output-content.rendered h2 { font-size: 16px; font-weight: 600; color: var(--text-primary); margin: 20px 0 8px 0; }
+    .output-content.rendered h3 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 16px 0 6px 0; }
+    .output-content.rendered p { font-size: 13px; line-height: 1.75; margin: 0 0 10px 0; color: var(--text-secondary); }
+    .output-content.rendered ul, .output-content.rendered ol { font-size: 13px; line-height: 1.75; margin: 0 0 10px 16px; color: var(--text-secondary); }
+    .output-content.rendered li { margin-bottom: 4px; }
+    .output-content.rendered strong { color: var(--text-primary); font-weight: 600; }
+    .output-content.rendered em { font-style: italic; }
+    .output-content.rendered blockquote { border-left: 3px solid var(--accent); padding: 4px 12px; margin: 8px 0; color: var(--text-muted); font-size: 13px; }
+    .output-content.rendered code { background: var(--bg-tertiary); padding: 1px 4px; border-radius: 3px; font-size: 12px; font-family: "SF Mono", "Cascadia Code", monospace; }
+    .output-content.rendered pre { background: var(--bg-tertiary); padding: 10px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+    .output-content.rendered pre code { background: none; padding: 0; }
+    .output-content.rendered hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+    .output-content.rendered a { color: var(--accent); text-decoration: none; }
+    .output-content.rendered a:hover { text-decoration: underline; }
+    .output-empty { color: var(--text-muted); font-size: 13px; }
+
+    /* Sources */
+    .source-item {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      margin-bottom: 6px;
+      background: var(--bg-tertiary);
+    }
+    .source-item a {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .source-item a:hover { text-decoration: underline; }
+    .source-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 3px;
+      display: flex;
+      gap: 8px;
+    }
+    .source-tag {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 500;
+    }
+    .source-tag.usable { background: rgba(63,185,80,0.12); color: var(--green); }
+    .source-tag.skipped { background: rgba(248,81,73,0.1); color: var(--red); }
+    .sources-empty { color: var(--text-muted); font-size: 13px; }
+
+    /* Model selector */
+    .profile-toggle {
+      display: flex;
+      gap: 0;
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+    .profile-btn {
+      flex: 1;
+      padding: 5px 0;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+    .profile-btn:hover { background: var(--bg-tertiary); color: var(--text-secondary); }
+    .profile-btn.active {
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+    }
+    .model-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      margin-bottom: 4px;
+      cursor: pointer;
+      transition: background 0.12s;
+    }
+    .model-item:hover { background: var(--bg-tertiary); }
+    .model-item.active-model {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+    }
+    .model-radio {
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      border: 2px solid var(--border);
+      margin-top: 2px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .model-item.active-model .model-radio {
+      border-color: var(--accent);
+    }
+    .model-item.active-model .model-radio::after {
+      content: '';
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+    .model-info { flex: 1; min-width: 0; }
+    .model-name-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .model-name {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .model-size {
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .model-desc {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 1px;
+    }
+    .model-status-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .model-tag {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 500;
+    }
+    .model-tag.installed { background: rgba(63,185,80,0.1); color: var(--green); }
+    .model-tag.not-installed { background: var(--bg-primary); color: var(--text-muted); }
+    .model-tag.active-tag { background: rgba(74,142,255,0.15); color: var(--accent); }
+    .model-tag.default-tag { background: rgba(210,153,34,0.1); color: var(--yellow); }
+    .model-tag.category { background: var(--bg-primary); color: var(--text-muted); }
+    .model-action-btn {
+      padding: 2px 8px;
+      font-size: 10px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .model-action-btn.pulling {
+      color: var(--yellow);
+      border-color: rgba(210,153,34,0.3);
+      cursor: wait;
+    }
+    .model-empty { color: var(--text-muted); font-size: 13px; }
+
+    /* Settings panel */
+    .settings-toggle-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+    }
+    .settings-toggle-header .card-label { margin-bottom: 0; }
+    .settings-chevron {
+      font-size: 10px;
+      color: var(--text-muted);
+      transition: transform 0.15s;
+    }
+    .settings-body { display: none; margin-top: 12px; }
+    .settings-body.open { display: block; }
+    .settings-body.open ~ .settings-toggle-header .settings-chevron,
+    .settings-chevron.open { transform: rotate(90deg); }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .settings-row label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    .settings-row input[type="number"],
+    .settings-row input[type="range"] {
+      width: 80px;
+      padding: 4px 6px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 12px;
+      font-family: inherit;
+    }
+    .settings-row input[type="number"]:focus {
+      outline: none;
+      border-color: var(--border-focus);
+    }
+    .settings-row input[type="range"] {
+      -webkit-appearance: none;
+      width: 70px;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      border: none;
+      padding: 0;
+    }
+    .settings-row input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    .settings-row .range-val {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+      min-width: 26px;
+      text-align: right;
+    }
+    .settings-row input[type="checkbox"] {
+      accent-color: var(--accent);
+    }
+    .settings-save-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .settings-saved-msg {
+      font-size: 11px;
+      color: var(--green);
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    .settings-saved-msg.show { opacity: 1; }
+
+    /* Degraded notice */
+    .degraded-notice {
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      background: rgba(210, 153, 34, 0.08);
+      border: 1px solid rgba(210, 153, 34, 0.2);
+      color: var(--yellow);
+    }
+    .degraded-notice.hidden { display: none; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3d444d; }
+
+    /* Responsive */
+    @media (max-width: 800px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+    }
   </style>
 </head>
 <body>
-<div id="setupPanel" class="card hidden" style="margin:12px">
-  <h3>Setup & Diagnostics</h3>
-  <div id="healthSummary"></div>
-  <div id="healthChecks"></div>
-  <div style="margin-top:8px">
-    <button id="repairPlaywrightBtn">Repair Playwright</button>
-    <button id="repairModelBtn">Pull Recommended Model</button>
-    <button id="repairDbBtn">Repair DB</button>
-    <button id="resetSettingsBtn">Reset Settings</button>
-    <button id="refreshHealthBtn">Refresh Health</button>
+
+<div class="topbar">
+  <div class="topbar-title">Local Research Agent</div>
+  <div class="topbar-right">
+    <div class="topbar-status" id="healthToggle" onclick="toggleSetup()">
+      <span class="health-dot" id="healthDot"></span>
+      <span id="healthLabel">Checking...</span>
+    </div>
   </div>
-  <div id="repairStatus" class="muted"></div>
 </div>
 
-<div class="wrap">
-  <div>
+<div id="setupPanel" class="setup-banner hidden">
+  <div class="setup-header">
+    <h3>Setup &amp; Diagnostics</h3>
+    <button class="btn-ghost" onclick="toggleSetup()">Dismiss</button>
+  </div>
+  <div class="setup-checks" id="healthChecks"></div>
+  <div class="setup-actions">
+    <button id="repairPlaywrightBtn">Repair Playwright</button>
+    <button id="repairModelBtn">Pull Model</button>
+    <button id="repairDbBtn">Repair DB</button>
+    <button id="resetSettingsBtn">Reset Settings</button>
+    <button id="refreshHealthBtn">Refresh</button>
+  </div>
+  <div id="repairStatus"></div>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+
     <div class="card">
-      <h3>New Task</h3>
-      <textarea id="taskInput" placeholder="Research local memory systems"></textarea>
-      <button id="submitBtn">Submit</button>
-      <button id="cancelBtn">Cancel Task</button>
-      <p>Status: <span id="status">idle</span></p>
-      <div id="stateHint" class="muted">No task selected.</div>
+      <div class="card-label">New Task</div>
+      <textarea id="taskInput" placeholder="What do you want to research?"></textarea>
+      <div class="btn-row">
+        <button class="btn-primary" id="submitBtn">Submit</button>
+        <button class="btn-danger" id="cancelBtn">Cancel</button>
+      </div>
+      <div class="status-row">
+        <span class="badge badge-idle" id="statusBadge">idle</span>
+        <span class="state-hint" id="stateHint">No task selected.</span>
+      </div>
     </div>
 
-    <div class="card" style="margin-top:12px">
-      <h3>Plan Review</h3>
-      <div id="planView" class="muted">No plan yet.</div>
-      <button id="confirmPlanBtn">Confirm</button>
-      <button id="rejectPlanBtn">Reject</button>
+    <div class="card">
+      <div class="card-label">Model</div>
+      <div class="profile-toggle">
+        <button class="profile-btn active" data-profile="pro" onclick="switchProfile('pro')">Pro</button>
+        <button class="profile-btn" data-profile="air" onclick="switchProfile('air')">Air</button>
+      </div>
+      <div id="modelList"><span class="model-empty">Loading models...</span></div>
     </div>
 
-    <div class="card" style="margin-top:12px">
-      <h3>Sessions</h3>
+    <div class="card">
+      <div class="settings-toggle-header" onclick="toggleSettings()">
+        <div class="card-label">Settings</div>
+        <span class="settings-chevron" id="settingsChevron">&#9654;</span>
+      </div>
+      <div class="settings-body" id="settingsBody">
+        <div class="settings-row"><label>Max Iterations</label><input type="number" id="sMaxIter" min="1" max="50" /></div>
+        <div class="settings-row"><label>Max Runtime (s)</label><input type="number" id="sMaxRuntime" min="30" max="36000" /></div>
+        <div class="settings-row"><label>Results / Query</label><input type="number" id="sMaxPages" min="1" max="20" /></div>
+        <div class="settings-row">
+          <label>Reasoning Temp</label>
+          <input type="range" id="sReasonTemp" min="0" max="1" step="0.1" oninput="document.getElementById('sReasonTempVal').textContent=this.value" />
+          <span class="range-val" id="sReasonTempVal">0.4</span>
+        </div>
+        <div class="settings-row">
+          <label>Synthesis Temp</label>
+          <input type="range" id="sSynthTemp" min="0" max="1" step="0.1" oninput="document.getElementById('sSynthTempVal').textContent=this.value" />
+          <span class="range-val" id="sSynthTempVal">0.4</span>
+        </div>
+        <div class="settings-row"><label>Max Report Tokens</label><input type="number" id="sSynthTokens" min="512" max="32768" /></div>
+        <div class="settings-row"><label>Top Sources Cap</label><input type="number" id="sTopSources" min="1" max="30" /></div>
+        <div class="settings-row"><label>Query Delay (s)</label><input type="number" id="sQueryDelay" min="0" max="30" step="0.5" /></div>
+        <div class="settings-row"><label>Iteration Cooldown (s)</label><input type="number" id="sIterCooldown" min="0" max="60" step="0.5" /></div>
+        <div class="settings-row"><label>Cache Enabled</label><input type="checkbox" id="sCacheEnabled" /></div>
+        <div class="settings-save-row">
+          <button class="btn-confirm" id="saveSettingsBtn">Save</button>
+          <span class="settings-saved-msg" id="settingsSavedMsg">Saved</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Plan Review</div>
+      <div id="planView" class="plan-empty">No plan yet.</div>
+      <div class="plan-actions btn-row" id="planActions" style="display:none">
+        <button class="btn-confirm" id="confirmPlanBtn">Confirm Plan</button>
+        <button class="btn-danger" id="rejectPlanBtn">Reject</button>
+      </div>
+    </div>
+
+    <div class="card" style="flex:1; min-height:0;">
+      <div class="card-label">Sessions</div>
       <div id="history"></div>
     </div>
   </div>
 
-  <div>
-    <div id="degradedNote" class="card hidden warn">Degraded mode: some dependencies are missing. Tasks may run with reduced capability.</div>
-    <div class="card"><h3>Activity</h3><div id="activity"></div></div>
-    <div class="card" style="margin-top:12px"><h3>Output</h3><button id="copyMdBtn">Copy markdown</button><button id="downloadMdBtn">Download markdown</button><div id="output"></div></div>
-    <div class="card" style="margin-top:12px"><h3>Sources</h3><div id="sources"></div></div>
+  <div class="main">
+    <div id="degradedNote" class="degraded-notice hidden">Degraded mode — some dependencies are missing. Tasks may run with reduced capability.</div>
+
+    <div class="card" style="flex: 1 1 auto; min-height: 0;">
+      <div class="trace-header-bar">
+        <div class="card-label" style="margin-bottom:0">Trace</div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span class="trace-counter" id="traceCounter"></span>
+          <button class="btn-ghost" id="downloadLogBtn" title="Download trace log">Log</button>
+          <button class="btn-ghost" id="clearTraceBtn">Clear</button>
+        </div>
+      </div>
+      <div id="trace" class="trace-container"><span class="trace-empty">Waiting for a task...</span></div>
+    </div>
+
+    <div class="card" style="flex: 0 0 auto;">
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+        <div class="card-label" style="margin-bottom:0">Output</div>
+        <div class="output-actions">
+          <button class="btn-ghost" id="copyMdBtn">Copy</button>
+          <button class="btn-ghost" id="downloadMdBtn">Download</button>
+        </div>
+      </div>
+      <div class="output-tabs">
+        <button class="output-tab active" data-tab="consolidated" onclick="switchOutputTab('consolidated')">Consolidated Report</button>
+        <button class="output-tab" data-tab="detailed" onclick="switchOutputTab('detailed')">Detailed Findings</button>
+      </div>
+      <div id="outputConsolidated" class="output-panel active">
+        <div id="output" class="output-content"><span class="output-empty">No output yet.</span></div>
+      </div>
+      <div id="outputDetailed" class="output-panel">
+        <div id="outputFindings" class="output-content"><span class="output-empty">No detailed findings yet.</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Sources</div>
+      <div id="sources"><span class="sources-empty">No sources yet.</span></div>
+    </div>
   </div>
 </div>
 
 <script>
-let currentTaskId=null, es=null;
-function setStatus(s){ document.getElementById('status').textContent=s; }
-function log(msg){ const a=document.getElementById('activity'); a.textContent += `• ${msg}\n`; a.scrollTop=a.scrollHeight; }
-function stateHint(msg){ document.getElementById('stateHint').textContent=msg; }
+let currentTaskId = null, es = null, setupVisible = false;
+let currentProfile = 'pro', pullingModels = new Set(), pullPoller = null;
+let traceCount = 0;
 
-async function refreshHealth(){
-  const h=await (await fetch('/api/health')).json();
-  document.getElementById('healthSummary').textContent = `Overall: ${h.overall_status}`;
-  const checks=document.getElementById('healthChecks'); checks.innerHTML='';
-  h.checks.forEach(c=>{ const d=document.createElement('div'); d.className=`${c.status}`; d.textContent=`${c.name}: ${c.status.toUpperCase()} — ${c.message}`; checks.appendChild(d); });
-
-  const setupNeeded = h.overall_status !== 'healthy';
-  document.getElementById('setupPanel').classList.toggle('hidden', !setupNeeded);
-  document.getElementById('degradedNote').classList.toggle('hidden', h.overall_status === 'healthy');
+function setStatus(s) {
+  const el = document.getElementById('statusBadge');
+  el.textContent = s;
+  el.className = 'badge badge-' + s;
 }
 
-async function repair(path){
-  const el=document.getElementById('repairStatus');
-  el.textContent='Repair in progress...';
-  const res=await (await fetch(path,{method:'POST'})).json();
-  el.textContent = res.message || JSON.stringify(res);
+function addTrace(type, label, detail) {
+  const container = document.getElementById('trace');
+  if (container.querySelector('.trace-empty')) container.innerHTML = '';
+  traceCount++;
+  document.getElementById('traceCounter').textContent = traceCount + ' events';
+
+  const now = new Date();
+  const ts = String(now.getHours()).padStart(2,'0') + ':' +
+             String(now.getMinutes()).padStart(2,'0') + ':' +
+             String(now.getSeconds()).padStart(2,'0');
+
+  const item = document.createElement('div');
+  item.className = 'trace-item t-' + type;
+
+  const hasDetail = detail && detail.trim().length > 0;
+
+  const isThinking = type === 'model_result' && /\[(THOUGHTS|REASONING|CRITICISM|PLAN|DECISION|OBSERVATION)/.test(label);
+
+  item.innerHTML =
+    '<div class="trace-header">' +
+      '<span class="trace-label">' + escHtml(label) + '</span>' +
+      '<span class="trace-time">' + ts + '</span>' +
+      (hasDetail ? '<span class="trace-expand">\u25B6</span>' : '') +
+    '</div>' +
+    (hasDetail ? '<div class="trace-body">' + escHtml(detail) + '</div>' : '');
+
+  if (hasDetail) {
+    item.onclick = () => item.classList.toggle('expanded');
+    if (isThinking) item.classList.add('expanded');
+  }
+
+  container.appendChild(item);
+  container.scrollTop = container.scrollHeight;
+}
+
+function clearTrace() {
+  document.getElementById('trace').innerHTML = '<span class="trace-empty">Waiting for a task...</span>';
+  traceCount = 0;
+  document.getElementById('traceCounter').textContent = '';
+}
+
+function stateHint(msg) {
+  document.getElementById('stateHint').textContent = msg;
+}
+
+function showPlanActions(show) {
+  document.getElementById('planActions').style.display = show ? 'flex' : 'none';
+}
+
+function toggleSetup() {
+  setupVisible = !setupVisible;
+  document.getElementById('setupPanel').classList.toggle('hidden', !setupVisible);
+}
+
+async function refreshHealth() {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    const dot = document.getElementById('healthDot');
+    const label = document.getElementById('healthLabel');
+    dot.className = 'health-dot ' + h.overall_status;
+    const labels = { healthy: 'Healthy', degraded: 'Degraded', setup_required: 'Setup Required' };
+    label.textContent = labels[h.overall_status] || h.overall_status;
+
+    const checks = document.getElementById('healthChecks');
+    checks.innerHTML = '';
+    h.checks.forEach(c => {
+      const icons = { pass: '\u2713', warn: '\u26A0', fail: '\u2717' };
+      const d = document.createElement('div');
+      d.className = 'check-item ' + c.status;
+      d.innerHTML = '<span class="check-icon">' + (icons[c.status] || '') + '</span> ' + c.name + ': ' + c.message;
+      checks.appendChild(d);
+    });
+
+    const needsSetup = h.overall_status === 'setup_required';
+    if (needsSetup) {
+      setupVisible = true;
+      document.getElementById('setupPanel').classList.remove('hidden');
+    }
+    document.getElementById('degradedNote').classList.toggle('hidden', h.overall_status === 'healthy');
+  } catch (e) {
+    document.getElementById('healthLabel').textContent = 'Unreachable';
+  }
+}
+
+async function repair(path) {
+  const el = document.getElementById('repairStatus');
+  el.textContent = 'Repair in progress...';
+  try {
+    const res = await (await fetch(path, { method: 'POST' })).json();
+    el.textContent = res.message || JSON.stringify(res);
+  } catch (e) {
+    el.textContent = 'Repair request failed.';
+  }
   await refreshHealth();
 }
 
-function renderTask(t){
+function renderPlan(plan) {
+  const view = document.getElementById('planView');
+  if (!plan) {
+    view.innerHTML = '<span class="plan-empty">No plan yet.</span>';
+    showPlanActions(false);
+    return;
+  }
+  let html = '<div class="plan-goal">' + escHtml(plan.goal) + '</div>';
+  plan.steps.forEach(s => {
+    html += '<div class="plan-step"><span class="plan-step-num">' + s.step_number + '.</span><span>' + escHtml(s.description) + '</span></div>';
+  });
+  view.innerHTML = html;
+  showPlanActions(true);
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function switchOutputTab(tab) {
+  document.querySelectorAll('.output-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.getElementById('outputConsolidated').classList.toggle('active', tab === 'consolidated');
+  document.getElementById('outputDetailed').classList.toggle('active', tab === 'detailed');
+}
+
+function renderTask(t) {
   setStatus(t.status);
-  document.getElementById('planView').textContent = t.plan ? `Goal: ${t.plan.goal}\n` + t.plan.steps.map(s=>`${s.step_number}. ${s.description}`).join('\n') : 'No plan';
-  document.getElementById('output').textContent = t.output_markdown || '';
+  renderPlan(t.plan);
 
-  if(t.status==='failed') stateHint('Task failed. Check activity/logs for details.');
-  else if(t.status==='cancelled') stateHint('Task cancelled. Partial history is preserved.');
-  else if(t.status==='completed') stateHint('Task completed.');
-  else if(t.status==='planning') stateHint('Waiting for plan confirmation.');
-  else if(t.status==='running') stateHint('Task is running...');
+  const out = document.getElementById('output');
+  if (t.output_markdown) {
+    out.innerHTML = marked.parse(t.output_markdown);
+    out.classList.add('rendered');
+  } else {
+    out.innerHTML = '<span class="output-empty">No output yet.</span>';
+    out.classList.remove('rendered');
+  }
 
-  const sbox=document.getElementById('sources'); sbox.innerHTML='';
-  if(!(t.sources||[]).length){ sbox.innerHTML='<div class="muted">No sources yet.</div>'; }
-  (t.sources||[]).forEach(s=>{
-    const d=document.createElement('div'); d.className='step-item';
-    const state=s.extraction_status==='ok'?'usable':'skipped';
-    d.innerHTML=`<a href="${s.url}" target="_blank">${s.title||s.url}</a><div class="muted">${state} | ${s.quality||'unknown'} | ${s.extraction_method||'n/a'} | ${s.error_reason||'ok'}</div>`;
+  const findings = document.getElementById('outputFindings');
+  const detailedMd = (t.report_metadata && t.report_metadata.detailed_findings) || '';
+  if (detailedMd) {
+    findings.innerHTML = marked.parse(detailedMd);
+    findings.classList.add('rendered');
+  } else {
+    findings.innerHTML = '<span class="output-empty">No detailed findings yet.</span>';
+    findings.classList.remove('rendered');
+  }
+
+  if (t.status === 'failed') stateHint('Task failed.');
+  else if (t.status === 'cancelled') stateHint('Task cancelled.');
+  else if (t.status === 'completed') { stateHint('Completed.'); showPlanActions(false); }
+  else if (t.status === 'planning') stateHint('Waiting for plan confirmation.');
+  else if (t.status === 'running') { stateHint('Running...'); showPlanActions(false); }
+
+  const sbox = document.getElementById('sources');
+  sbox.innerHTML = '';
+  if (!(t.sources || []).length) {
+    sbox.innerHTML = '<span class="sources-empty">No sources yet.</span>';
+    return;
+  }
+  (t.sources || []).forEach(s => {
+    const usable = s.extraction_status === 'ok';
+    const d = document.createElement('div');
+    d.className = 'source-item';
+    d.innerHTML =
+      '<a href="' + escHtml(s.url) + '" target="_blank" rel="noopener">' + escHtml(s.title || s.url) + '</a>' +
+      '<div class="source-meta">' +
+        '<span class="source-tag ' + (usable ? 'usable' : 'skipped') + '">' + (usable ? 'usable' : 'skipped') + '</span>' +
+        '<span>' + (s.quality || 'unknown') + '</span>' +
+        '<span>' + (s.extraction_method || '') + '</span>' +
+        (s.error_reason && s.error_reason !== 'ok' ? '<span>' + escHtml(s.error_reason) + '</span>' : '') +
+      '</div>';
     sbox.appendChild(d);
   });
 }
 
-async function loadTask(id){
-  const t=await (await fetch(`/api/tasks/${id}`)).json();
-  currentTaskId=id; renderTask(t);
+async function loadTask(id) {
+  const t = await (await fetch('/api/tasks/' + id)).json();
+  currentTaskId = id;
+  renderTask(t);
+  document.querySelectorAll('.history-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.id === id);
+  });
+
+  // Load saved traces from DB
+  clearTrace();
+  try {
+    const res = await fetch('/api/tasks/' + id + '/traces');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.traces && data.traces.length > 0) {
+        data.traces.forEach(tr => {
+          addTrace(tr.trace_type || 'info', tr.label || '', tr.detail || '');
+        });
+      }
+    }
+  } catch (e) {}
+
+  // If task is still running, attach live event stream
+  if (t.status === 'running' || t.status === 'planning') {
+    attachEvents(id);
+  }
 }
 
-async function loadHistory(){
-  const items=await (await fetch('/api/tasks')).json();
-  const box=document.getElementById('history'); box.innerHTML='';
-  if(!items.length){ box.innerHTML='<div class="muted">No sessions yet.</div>'; return; }
-  items.forEach(i=>{ const b=document.createElement('button'); b.style.width='100%'; b.textContent=`${i.status} | conflicts:${i.conflict_count||0} | ${i.input_text.slice(0,45)}`; b.onclick=()=>loadTask(i.id); box.appendChild(b); });
+async function loadHistory() {
+  const items = await (await fetch('/api/tasks')).json();
+  const box = document.getElementById('history');
+  box.innerHTML = '';
+  if (!items.length) {
+    box.innerHTML = '<span class="history-empty">No sessions yet.</span>';
+    return;
+  }
+  items.forEach(i => {
+    const b = document.createElement('button');
+    b.className = 'history-item' + (currentTaskId === i.id ? ' active' : '');
+    b.dataset.id = i.id;
+    b.innerHTML =
+      '<span class="badge badge-' + i.status + '">' + i.status + '</span>' +
+      '<span class="history-text">' + escHtml(i.input_text.slice(0, 60)) + '</span>';
+    b.onclick = () => loadTask(i.id);
+    box.appendChild(b);
+  });
 }
 
-function attachEvents(id){
-  if(es) es.close();
-  es=new EventSource(`/api/tasks/${id}/events`);
-  ['plan_created','plan_waiting_confirmation','plan_confirmed','fallback_triggered','warning','error','step_started','output_ready','source_skipped'].forEach(name=>{
-    es.addEventListener(name,e=>{
-      const d=JSON.parse(e.data);
-      if(d.message) log(d.message); else log(`${name}`);
-      if(name==='output_ready'){ loadTask(id); loadHistory(); }
-      if(name==='error'){ stateHint('Task hit a terminal error.'); }
+function attachEvents(id) {
+  if (es) es.close();
+  es = new EventSource('/api/tasks/' + id + '/events');
+
+  es.addEventListener('trace', e => {
+    const d = JSON.parse(e.data);
+    addTrace(d.trace_type || 'info', d.label || '', d.detail || '');
+  });
+
+  const eventTraceMap = {
+    plan_created: 'info',
+    plan_waiting_confirmation: 'info',
+    plan_confirmed: 'info',
+    fallback_triggered: 'warning',
+    warning: 'warning',
+    error: 'error',
+    step_started: 'event',
+    step_completed: 'event',
+    source_found: 'extract',
+    source_skipped: 'skip',
+    conflict_analysis_started: 'analysis',
+    conflict_analysis_completed: 'analysis',
+    final_synthesis_started: 'model_call',
+    final_synthesis_completed: 'model_result',
+    output_ready: 'info',
+  };
+
+  Object.keys(eventTraceMap).forEach(name => {
+    es.addEventListener(name, e => {
+      const d = JSON.parse(e.data);
+      const msg = d.message || name.replace(/_/g, ' ');
+      const detail = [];
+      if (d.url) detail.push('URL: ' + d.url);
+      if (d.reason) detail.push('Reason: ' + d.reason);
+      if (d.conflict_count !== undefined) detail.push('Conflicts: ' + d.conflict_count);
+      if (d.synthesis_mode) detail.push('Mode: ' + d.synthesis_mode);
+      if (d.plan_mode) detail.push('Plan mode: ' + d.plan_mode);
+      addTrace(eventTraceMap[name], msg, detail.join('\n'));
+
+      if (name === 'output_ready') { loadTask(id); loadHistory(); }
+      if (name === 'error') { stateHint('Task failed.'); setStatus('failed'); }
     });
   });
 }
 
-document.getElementById('submitBtn').onclick=async()=>{
-  const task=document.getElementById('taskInput').value;
-  const res=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task})});
-  if(!res.ok){ alert('Task submit failed'); return; }
-  const d=await res.json();
-  currentTaskId=d.task_id; setStatus(d.status); document.getElementById('planView').textContent = `Goal: ${d.plan.goal}\n` + d.plan.steps.map(s=>`${s.step_number}. ${s.description}`).join('\n');
-  attachEvents(d.task_id); loadHistory(); stateHint('Waiting for plan confirmation.');
+document.getElementById('submitBtn').onclick = async () => {
+  const task = document.getElementById('taskInput').value.trim();
+  if (!task) return;
+  setStatus('planning');
+  stateHint('Submitting...');
+  clearTrace();
+  document.getElementById('output').innerHTML = '<span class="output-empty">No output yet.</span>';
+  document.getElementById('output').classList.remove('rendered');
+  document.getElementById('outputFindings').innerHTML = '<span class="output-empty">No detailed findings yet.</span>';
+  document.getElementById('outputFindings').classList.remove('rendered');
+  document.getElementById('sources').innerHTML = '<span class="sources-empty">No sources yet.</span>';
+  document.getElementById('planView').innerHTML = '<span class="plan-empty">No plan yet.</span>';
+  showPlanActions(false);
+  switchOutputTab('consolidated');
+  addTrace('info', 'Submitting research task', task.length > 80 ? task.slice(0, 80) + '...' : '');
+
+  try {
+    const res = await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      stateHint('Submit failed: ' + (err.detail || 'unknown error'));
+      setStatus('failed');
+      return;
+    }
+    const d = await res.json();
+    currentTaskId = d.task_id;
+    setStatus(d.status);
+    renderPlan(d.plan);
+    attachEvents(d.task_id);
+    loadHistory();
+    stateHint('Waiting for plan confirmation.');
+  } catch (e) {
+    stateHint('Submit failed: network error');
+    setStatus('idle');
+  }
 };
 
-document.getElementById('confirmPlanBtn').onclick=async()=>{ if(currentTaskId) await fetch(`/api/tasks/${currentTaskId}/confirm`,{method:'POST'}); };
-document.getElementById('rejectPlanBtn').onclick=async()=>{ if(currentTaskId){ await fetch(`/api/tasks/${currentTaskId}/reject`,{method:'POST'}); setStatus('cancelled'); stateHint('Task cancelled before execution.'); } };
-document.getElementById('cancelBtn').onclick=async()=>{ if(currentTaskId){ await fetch(`/api/tasks/${currentTaskId}/cancel`,{method:'POST'}); setStatus('cancelled'); stateHint('Task cancelled.'); } };
+document.getElementById('confirmPlanBtn').onclick = async () => {
+  if (!currentTaskId) return;
+  await fetch('/api/tasks/' + currentTaskId + '/confirm', { method: 'POST' });
+  setStatus('running');
+  stateHint('Running...');
+  showPlanActions(false);
+};
 
-document.getElementById('copyMdBtn').onclick=async()=>{ await navigator.clipboard.writeText(document.getElementById('output').textContent||''); alert('Copied'); };
-document.getElementById('downloadMdBtn').onclick=()=>{ const txt=document.getElementById('output').textContent||''; const a=document.createElement('a'); const b=new Blob([txt],{type:'text/markdown'}); a.href=URL.createObjectURL(b); a.download=`task_${currentTaskId||'report'}.md`; a.click(); URL.revokeObjectURL(a.href); };
+document.getElementById('rejectPlanBtn').onclick = async () => {
+  if (!currentTaskId) return;
+  await fetch('/api/tasks/' + currentTaskId + '/reject', { method: 'POST' });
+  setStatus('cancelled');
+  stateHint('Plan rejected.');
+  showPlanActions(false);
+};
 
-document.getElementById('repairPlaywrightBtn').onclick=()=>repair('/api/repair/playwright');
-document.getElementById('repairModelBtn').onclick=()=>repair('/api/repair/model');
-document.getElementById('repairDbBtn').onclick=()=>repair('/api/repair/db');
-document.getElementById('resetSettingsBtn').onclick=()=>repair('/api/repair/settings/reset');
-document.getElementById('refreshHealthBtn').onclick=refreshHealth;
+document.getElementById('cancelBtn').onclick = async () => {
+  if (!currentTaskId) return;
+  await fetch('/api/tasks/' + currentTaskId + '/cancel', { method: 'POST' });
+  setStatus('cancelled');
+  stateHint('Cancelled.');
+  showPlanActions(false);
+};
+
+document.getElementById('copyMdBtn').onclick = async () => {
+  if (!currentTaskId) return;
+  try {
+    const res = await fetch('/api/tasks/' + currentTaskId);
+    const t = await res.json();
+    const md = t.output_markdown || '';
+    if (!md) return;
+    await navigator.clipboard.writeText(md);
+    const btn = document.getElementById('copyMdBtn');
+    btn.textContent = 'Copied';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  } catch (e) {}
+};
+
+document.getElementById('downloadMdBtn').onclick = async () => {
+  if (!currentTaskId) return;
+  try {
+    const res = await fetch('/api/tasks/' + currentTaskId);
+    const t = await res.json();
+    const md = t.output_markdown || '';
+    if (!md) return;
+    const a = document.createElement('a');
+    const b = new Blob([md], { type: 'text/markdown' });
+    a.href = URL.createObjectURL(b);
+    a.download = 'task_' + currentTaskId.slice(0, 8) + '.md';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) {}
+};
+
+document.getElementById('repairPlaywrightBtn').onclick = () => repair('/api/repair/playwright');
+document.getElementById('repairModelBtn').onclick = () => repair('/api/repair/model');
+document.getElementById('repairDbBtn').onclick = () => repair('/api/repair/db');
+document.getElementById('resetSettingsBtn').onclick = () => repair('/api/repair/settings/reset');
+document.getElementById('refreshHealthBtn').onclick = refreshHealth;
+
+async function loadModels() {
+  try {
+    const data = await (await fetch('/api/models?profile=' + currentProfile)).json();
+    const box = document.getElementById('modelList');
+    box.innerHTML = '';
+    if (!data.models.length) {
+      box.innerHTML = '<span class="model-empty">No models for this profile.</span>';
+      return;
+    }
+    data.models.forEach(m => {
+      const isActive = m.active;
+      const isPulling = pullingModels.has(m.id);
+      const div = document.createElement('div');
+      div.className = 'model-item' + (isActive ? ' active-model' : '');
+
+      let actionHtml = '';
+      if (isActive) {
+        actionHtml = '<span class="model-tag active-tag">active</span>';
+      } else if (isPulling) {
+        actionHtml = '<span class="model-tag pulling" style="color:var(--yellow)">pulling...</span>';
+      } else if (m.installed) {
+        actionHtml = '<button class="model-action-btn btn-confirm" data-activate="' + escHtml(m.id) + '">Use</button>';
+      } else {
+        actionHtml = '<button class="model-action-btn btn-primary" data-pull="' + escHtml(m.id) + '">Pull</button>';
+      }
+
+      div.innerHTML =
+        '<div class="model-radio"></div>' +
+        '<div class="model-info">' +
+          '<div class="model-name-row">' +
+            '<span class="model-name">' + escHtml(m.name) + '</span>' +
+            '<span class="model-size">' + escHtml(m.size) + '</span>' +
+          '</div>' +
+          '<div class="model-desc">' + escHtml(m.desc) + '</div>' +
+          '<div class="model-status-row">' +
+            '<span class="model-tag category">' + m.category + '</span>' +
+            (m.installed && !isActive ? '<span class="model-tag installed">installed</span>' : '') +
+            (!m.installed && !isPulling ? '<span class="model-tag not-installed">not installed</span>' : '') +
+            (m.default_for === currentProfile ? '<span class="model-tag default-tag">default</span>' : '') +
+            actionHtml +
+          '</div>' +
+        '</div>';
+
+      box.appendChild(div);
+    });
+
+    box.querySelectorAll('[data-activate]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const model = btn.dataset.activate;
+        await fetch('/api/models/activate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_name: model })
+        });
+        await loadModels();
+      };
+    });
+
+    box.querySelectorAll('[data-pull]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const model = btn.dataset.pull;
+        pullingModels.add(model);
+        await fetch('/api/models/pull', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_name: model })
+        });
+        loadModels();
+        startPullPoller();
+      };
+    });
+  } catch (e) {
+    document.getElementById('modelList').innerHTML = '<span class="model-empty">Failed to load models.</span>';
+  }
+}
+
+function switchProfile(profile) {
+  currentProfile = profile;
+  document.querySelectorAll('.profile-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.profile === profile);
+  });
+  loadModels();
+}
+
+function startPullPoller() {
+  if (pullPoller) return;
+  pullPoller = setInterval(async () => {
+    if (!pullingModels.size) {
+      clearInterval(pullPoller);
+      pullPoller = null;
+      return;
+    }
+    try {
+      const data = await (await fetch('/api/models?profile=' + currentProfile)).json();
+      const installedIds = new Set(data.models.filter(m => m.installed).map(m => m.id));
+      let changed = false;
+      for (const id of pullingModels) {
+        if (installedIds.has(id)) {
+          pullingModels.delete(id);
+          changed = true;
+        }
+      }
+      if (changed) loadModels();
+    } catch (e) {}
+  }, 8000);
+}
+
+document.getElementById('clearTraceBtn').onclick = clearTrace;
+
+document.getElementById('downloadLogBtn').onclick = async () => {
+  if (!currentTaskId) return;
+  try {
+    const res = await fetch('/api/tasks/' + currentTaskId + '/trace_log');
+    if (!res.ok) { alert('No trace log available yet'); return; }
+    const data = await res.json();
+    const blob = new Blob([data.log], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'trace_' + currentTaskId.slice(0, 8) + '.txt';
+    a.click();
+  } catch (e) { alert('Failed to download log'); }
+};
+
+function toggleSettings() {
+  const body = document.getElementById('settingsBody');
+  const chev = document.getElementById('settingsChevron');
+  body.classList.toggle('open');
+  chev.classList.toggle('open');
+}
+
+async function loadSettings() {
+  try {
+    const s = await (await fetch('/api/settings')).json();
+    document.getElementById('sMaxIter').value = s.max_iterations;
+    document.getElementById('sMaxRuntime').value = s.max_total_runtime_sec;
+    document.getElementById('sMaxPages').value = s.max_pages_per_query;
+    document.getElementById('sReasonTemp').value = s.reasoning_temperature;
+    document.getElementById('sReasonTempVal').textContent = s.reasoning_temperature;
+    document.getElementById('sSynthTemp').value = s.synthesis_temperature;
+    document.getElementById('sSynthTempVal').textContent = s.synthesis_temperature;
+    document.getElementById('sSynthTokens').value = s.synthesis_max_tokens;
+    document.getElementById('sTopSources').value = s.top_sources_cap;
+    document.getElementById('sQueryDelay').value = s.inter_query_delay;
+    document.getElementById('sIterCooldown').value = s.inter_iteration_cooldown;
+    document.getElementById('sCacheEnabled').checked = s.cache_enabled;
+  } catch (e) {}
+}
+
+document.getElementById('saveSettingsBtn').onclick = async () => {
+  const payload = {
+    max_iterations: parseInt(document.getElementById('sMaxIter').value) || undefined,
+    max_total_runtime_sec: parseInt(document.getElementById('sMaxRuntime').value) || undefined,
+    max_pages_per_query: parseInt(document.getElementById('sMaxPages').value) || undefined,
+    reasoning_temperature: parseFloat(document.getElementById('sReasonTemp').value),
+    synthesis_temperature: parseFloat(document.getElementById('sSynthTemp').value),
+    synthesis_max_tokens: parseInt(document.getElementById('sSynthTokens').value) || undefined,
+    top_sources_cap: parseInt(document.getElementById('sTopSources').value) || undefined,
+    inter_query_delay: parseFloat(document.getElementById('sQueryDelay').value),
+    inter_iteration_cooldown: parseFloat(document.getElementById('sIterCooldown').value),
+    cache_enabled: document.getElementById('sCacheEnabled').checked,
+  };
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const msg = document.getElementById('settingsSavedMsg');
+      msg.classList.add('show');
+      setTimeout(() => msg.classList.remove('show'), 2000);
+    }
+  } catch (e) {}
+};
 
 refreshHealth();
 loadHistory();
+loadModels();
+loadSettings();
 </script>
 </body>
 </html>
