@@ -219,44 +219,126 @@ async def _direct_synthesis(
     model_name: str,
     temperature: float = cfg.SYNTHESIS_TEMPERATURE,
     max_tokens: int = cfg.SYNTHESIS_MAX_TOKENS,
+    criteria: list[str] | None = None,
 ) -> str:
-    """Single-shot synthesis for focused topics. One LLM call, no intermediaries."""
+    """
+    Synthesis for fewer sources — still uses multi-section writing when criteria exist.
+    Each criterion gets its own dedicated writer call for depth.
+    """
     source_blocks = []
     for s in sources:
         title = s.get("title") or "Untitled"
         text = (s.get("content_text") or "")[:cfg.SOURCE_CONTENT_LENGTH]
         source_blocks.append(f"SOURCE: {title}\n{text}")
+    all_source_text = "\n\n---\n\n".join(source_blocks)
+
+    if not criteria or len(criteria) < 2:
+        # Very simple task — single call is fine
+        prompt = (
+            f"Write a comprehensive research report on: {task_text}\n\n"
+            f"SOURCES:\n{all_source_text}\n\n"
+            "Write a DETAILED markdown report. Include an executive summary, "
+            "multiple detailed sections, actionable recommendations, and a conclusion.\n"
+            "Be specific — name tools, strategies, numbers. Be opinionated — recommend the best options.\n\n"
+            "REPORT:\n"
+        )
+        try:
+            return await ollama_generate(prompt, ollama_base_url, model_name, timeout=cfg.SYNTHESIS_TIMEOUT, max_tokens=max_tokens, temperature=temperature)
+        except Exception:
+            return f"# {task_text}\n\n{all_source_text}"
+
+    # Multi-section approach even for direct synthesis
+    section_markdowns: list[str] = []
+    section_summaries: list[str] = []
+
+    for criterion in criteria:
+        section_title = criterion[:120].rstrip(".,")
+        section_md = await _write_section(
+            task_text, section_title, all_source_text[:8000], "",
+            ollama_base_url, model_name, temperature=temperature, max_tokens=min(max_tokens, cfg.SECTION_WRITER_MAX_TOKENS),
+        )
+        if section_md.strip():
+            if not section_md.strip().startswith("##"):
+                section_md = f"## {section_title}\n\n{section_md}"
+            section_markdowns.append(section_md)
+            first_para = section_md.split("\n\n")[1] if "\n\n" in section_md else section_md[:200]
+            section_summaries.append(f"Section: {section_title}\nSummary: {first_para[:300]}")
+
+    summaries_text = "\n\n".join(section_summaries) if section_summaries else "No sections."
+    exec_summary, recommendations, conclusion = await _write_bookends(
+        task_text, summaries_text, criteria, ollama_base_url, model_name,
+        temperature=temperature, max_tokens=min(max_tokens, cfg.SECTION_WRITER_MAX_TOKENS),
+    )
+
+    title_kw = task_text[:80].rstrip(".,!?")
+    parts = [f"# {title_kw}\n"]
+    if exec_summary:
+        parts.append(f"## Executive Summary\n\n{exec_summary}\n")
+    for section in section_markdowns:
+        parts.append(f"\n{section}\n")
+    if recommendations:
+        parts.append(f"\n## Actionable Recommendations\n\n{recommendations}\n")
+    if conclusion:
+        parts.append(f"\n## Conclusion\n\n{conclusion}\n")
+    return "\n".join(parts)
+
+
+async def _extract_facts_from_source(
+    task_text: str,
+    source: dict[str, Any],
+    ollama_base_url: str,
+    model_name: str,
+    temperature: float = cfg.ANALYST_TEMPERATURE,
+    max_tokens: int = cfg.ANALYST_MAX_TOKENS,
+    criteria: list[str] | None = None,
+) -> str:
+    """
+    Fact-extractor agent: one agent per source, outputs structured bullet-point facts.
+    Asks the model to answer each criterion specifically from THIS source only.
+    """
+    title = source.get("title") or "Untitled"
+    text = (source.get("content_text") or "")[:cfg.SOURCE_CONTENT_LENGTH]
+
+    criteria_qs = ""
+    if criteria:
+        criteria_qs = "QUESTIONS TO ANSWER FROM THIS SOURCE:\n" + "\n".join(
+            f"  Q{i+1}: {c}" for i, c in enumerate(criteria)
+        ) + "\n\n"
 
     prompt = (
-        "You are a research writer. Write a DETAILED, comprehensive research report based on the sources below.\n\n"
-        f"RESEARCH QUESTION: {task_text}\n\n"
-        + "\n\n---\n\n".join(source_blocks) + "\n\n"
-        "Write a thorough, in-depth report in markdown format:\n"
-        "- Start with a clear title using #\n"
-        "- Write a substantial executive summary paragraph\n"
-        "- Create as many logical sections with ## headings as the topic demands\n"
-        "- Each section should have detailed paragraphs with specific facts, examples, numbers, and context\n"
-        "- Include relevant background, history, and technical details\n"
-        "- End with a thorough ## Conclusion summarizing key takeaways\n\n"
-        "IMPORTANT: Write as much useful detail as possible. Include everything from the sources.\n"
-        "Do not be brief. Cover every angle, every fact, every detail. More is better.\n\n"
+        f"You are a fact extractor. Read the source below and extract specific, concrete facts.\n\n"
+        f"RESEARCH TOPIC: {task_text}\n\n"
+        + criteria_qs
+        + f"SOURCE TITLE: {title}\n"
+        f"SOURCE CONTENT:\n{text}\n\n"
+        "Extract facts in this EXACT format:\n\n"
+        + (
+            "\n".join(
+                f"Q{i+1} FACTS:\n- [specific fact from source, or NONE]\n- [another fact if found]"
+                for i in range(len(criteria or []))
+            ) + "\n\n"
+            if criteria else ""
+        )
+        + "OTHER RELEVANT FACTS:\n"
+        "- [any other useful specific facts from this source]\n\n"
         "STRICT RULES:\n"
-        "- Do NOT include any URLs, links, or source references\n"
-        "- Do NOT include a sources/references section\n"
-        "- Write for a reader who wants to deeply UNDERSTAND the topic\n\n"
-        "REPORT:\n"
+        "- Only include facts EXPLICITLY stated in the source content above\n"
+        "- Name specific tools, platforms, companies, and techniques mentioned in the source\n"
+        "- Include numbers, statistics, and concrete details when present\n"
+        "- Write NONE if the source does not address a question\n"
+        "- Do NOT add your own knowledge — only extract from the source\n"
+        "- Do NOT include URLs\n"
     )
 
     try:
-        return await ollama_generate(prompt, ollama_base_url, model_name, timeout=cfg.SYNTHESIS_TIMEOUT, max_tokens=max_tokens, temperature=temperature)
+        return await ollama_generate(
+            prompt, ollama_base_url, model_name,
+            timeout=cfg.ANALYST_TIMEOUT, max_tokens=max_tokens, temperature=temperature,
+        )
     except Exception:
-        facts = []
-        for s in sources[:6]:
-            text = (s.get("content_text") or "")
-            sentences = [sent.strip() for sent in re.split(r"[.!?]\s+", text[:2000]) if len(sent.strip()) > 30]
-            if sentences:
-                facts.extend(sentences[:3])
-        return f"# {task_text}\n\n" + "\n\n".join(facts) if facts else f"# {task_text}\n\nInsufficient data for report."
+        # Fallback: grab first meaningful sentences from the source
+        sentences = [s.strip() for s in re.split(r"[.!?]\s+", text[:2000]) if len(s.strip()) > 30]
+        return "\n".join(f"- {s}" for s in sentences[:5]) if sentences else "- No extractable facts."
 
 
 async def _analyze_source_batch(
@@ -267,86 +349,373 @@ async def _analyze_source_batch(
     model_name: str,
     temperature: float = cfg.ANALYST_TEMPERATURE,
     max_tokens: int = cfg.ANALYST_MAX_TOKENS,
+    criteria: list[str] | None = None,
 ) -> str:
-    """Analyst agent: extract key insights from a batch of 2-3 sources."""
-    source_blocks = []
+    """
+    Analyst agent: runs _extract_facts_from_source on each source in the batch
+    sequentially and concatenates results. Kept for backward compatibility with
+    the coordinator's thematic grouping, but delegates to per-source extraction.
+    """
+    parts = []
     for s in batch:
-        title = s.get("title") or "Untitled"
-        text = (s.get("content_text") or "")[:cfg.SOURCE_CONTENT_LENGTH]
-        source_blocks.append(f"SOURCE: {title}\n{text}")
-
-    prompt = (
-        "You are a thorough research analyst. Read the sources below and extract ALL information relevant to the research question.\n\n"
-        f"RESEARCH QUESTION: {task_text}\n\n"
-        + "\n\n---\n\n".join(source_blocks) + "\n\n"
-        "Write a detailed analysis covering:\n"
-        "- Every important fact, data point, statistic, and claim\n"
-        "- Expert opinions, notable quotes, and key arguments\n"
-        "- Specific examples, numbers, dates, names, and technical details\n"
-        "- Historical context or background information\n"
-        "- How this information answers the research question\n\n"
-        "Be THOROUGH — extract every useful detail. Do not skip or summarize away information.\n"
-        "Write as many paragraphs as needed to capture all the information.\n"
-        "Do NOT include URLs or source references. State facts directly.\n\n"
-        "ANALYSIS:\n"
-    )
-
-    try:
-        return await ollama_generate(prompt, ollama_base_url, model_name, timeout=cfg.ANALYST_TIMEOUT, max_tokens=max_tokens, temperature=temperature)
-    except Exception:
-        facts = []
-        for s in batch:
-            text = (s.get("content_text") or "")
-            sentences = [sent.strip() for sent in re.split(r"[.!?]\s+", text[:2000]) if len(sent.strip()) > 30]
-            if sentences:
-                facts.extend(sentences[:3])
-        return "\n".join(facts) if facts else "Analysis unavailable for this batch."
+        result = await _extract_facts_from_source(
+            task_text, s, ollama_base_url, model_name,
+            temperature=temperature, max_tokens=min(max_tokens, cfg.ANALYST_MAX_TOKENS),
+            criteria=criteria,
+        )
+        parts.append(f"[Source: {(s.get('title') or 'Untitled')[:60]}]\n{result.strip()}")
+    return "\n\n---\n\n".join(parts) if parts else "No facts extracted."
 
 
-async def _synthesize_final(
+async def _analyze_and_judge(
     task_text: str,
-    analyses: list[str],
+    extracts: list[str],
     ollama_base_url: str,
     model_name: str,
     temperature: float = cfg.SYNTHESIS_TEMPERATURE,
     max_tokens: int = cfg.SYNTHESIS_MAX_TOKENS,
+    criteria: list[str] | None = None,
 ) -> str:
-    """Synthesizer agent: combine all analyses into a clean, reader-friendly report."""
-    analyses_text = "\n\n---\n\n".join(
-        f"ANALYSIS {i}:\n{a.strip()}" for i, a in enumerate(analyses, 1) if a.strip()
+    """
+    Analysis/judgment agent: reads all per-source fact extracts, then produces
+    a deep comparative analysis with the model's own reasoning, trade-offs,
+    pros/cons, and recommendations. This is the "thinking" step before writing.
+    """
+    extracts_text = "\n\n---\n\n".join(
+        f"EXTRACT {i}:\n{a.strip()}" for i, a in enumerate(extracts, 1) if a.strip()
     )
 
+    criteria_block = ""
+    if criteria:
+        criteria_block = "RESEARCH CRITERIA:\n" + "\n".join(
+            f"  {i+1}. {c}" for i, c in enumerate(criteria)
+        ) + "\n\n"
+
     prompt = (
-        "You are a senior research writer. Below are research notes on a topic gathered from multiple sources. "
-        "Your job is to combine ALL of these notes into ONE thorough, well-written research report.\n\n"
+        "You are a senior research analyst. You have fact extracts from multiple sources.\n"
+        "Your job is to THINK DEEPLY about what these facts mean and provide expert analysis.\n\n"
         f"RESEARCH QUESTION: {task_text}\n\n"
-        f"RESEARCH NOTES:\n{analyses_text}\n\n"
-        "Write a DETAILED, comprehensive research report in markdown format. Requirements:\n"
-        "- Start with a clear, informative title using #\n"
-        "- Write a substantial executive summary\n"
-        "- Create as many logical sections with ## headings as needed to cover all aspects\n"
-        "- Each section should have detailed paragraphs with specific facts, examples, and context\n"
-        "- Include ALL specific facts, numbers, dates, names, and technical details from the notes\n"
-        "- If the notes contain contradictory information, present both sides and note the disagreement\n"
-        "- Provide background, context, comparisons, and implications where relevant\n"
-        "- End with a thorough ## Conclusion with key takeaways and forward-looking insights\n\n"
-        "IMPORTANT: Include EVERY piece of useful information from the notes.\n"
-        "Do not summarize away ANY details. More information is always better.\n"
-        "Do not repeat yourself — but do not leave anything out either.\n\n"
-        "STRICT RULES:\n"
-        "- Do NOT include any URLs, links, or source references\n"
-        "- Do NOT include a sources/references section\n"
-        "- Do NOT use source IDs like [1], [src_1], etc.\n"
-        "- Do NOT mention 'notes', 'research notes', or 'analysis'\n"
-        "- Write as if you are the expert who did the research yourself\n"
-        "- Write for a reader who wants to deeply UNDERSTAND the topic\n\n"
-        "REPORT:\n"
+        + criteria_block
+        + f"COLLECTED FACTS:\n{extracts_text}\n\n"
+        "Now write your ANALYSIS. For each criterion:\n\n"
+    )
+
+    if criteria:
+        for i, c in enumerate(criteria):
+            short = c[:80].rstrip(".,")
+            prompt += (
+                f"CRITERION {i+1}: {short}\n"
+                f"- What did the sources say about this?\n"
+                f"- What are the best options and why?\n"
+                f"- What are the trade-offs, pros, and cons?\n"
+                f"- What would you recommend and why?\n\n"
+            )
+
+    prompt += (
+        "OVERALL JUDGMENT:\n"
+        "- What is the best overall strategy based on all the evidence?\n"
+        "- What should the reader do first, second, third?\n"
+        "- What are the biggest risks or pitfalls?\n\n"
+        "Rules:\n"
+        "- Use the facts from the extracts as evidence, but ADD your own reasoning and judgment\n"
+        "- Compare options and explain WHY one is better than another\n"
+        "- Be opinionated — don't just list options, RECOMMEND the best ones\n"
+        "- Be specific: name tools, amounts, timelines, strategies\n"
+        "- Think about what a smart advisor would say, not just what the websites said\n"
     )
 
     try:
-        return await ollama_generate(prompt, ollama_base_url, model_name, timeout=cfg.SYNTHESIS_TIMEOUT, max_tokens=max_tokens, temperature=temperature)
+        return await ollama_generate(
+            prompt, ollama_base_url, model_name,
+            timeout=cfg.ANALYSIS_TIMEOUT, max_tokens=max_tokens, temperature=temperature,
+        )
     except Exception:
-        return f"# {task_text}\n\n" + "\n\n".join(a.strip() for a in analyses if a.strip())
+        return ""
+
+
+async def _write_section(
+    task_text: str,
+    section_title: str,
+    extracts_text: str,
+    analysis_text: str,
+    ollama_base_url: str,
+    model_name: str,
+    temperature: float = cfg.SYNTHESIS_TEMPERATURE,
+    max_tokens: int = cfg.SECTION_WRITER_MAX_TOKENS,
+) -> str:
+    """
+    Section writer agent: writes ONE deep report section with multiple paragraphs.
+    Each section gets its own dedicated LLM call so the model can focus entirely
+    on producing rich, detailed content for this one topic.
+    """
+    prompt = (
+        f"You are writing ONE section of a research report.\n\n"
+        f"OVERALL RESEARCH QUESTION: {task_text}\n\n"
+        f"THIS SECTION'S TOPIC: {section_title}\n\n"
+        f"RELEVANT FACTS FROM SOURCES:\n{extracts_text}\n\n"
+    )
+    if analysis_text.strip():
+        prompt += f"EXPERT ANALYSIS ON THIS TOPIC:\n{analysis_text}\n\n"
+
+    prompt += (
+        f"Write the section titled: ## {section_title}\n\n"
+        "REQUIREMENTS:\n"
+        "- Write 4-8 detailed paragraphs (at least 400 words total)\n"
+        "- Start with an overview paragraph that frames the topic\n"
+        "- Present ALL specific facts from the sources: name tools, platforms, numbers, techniques\n"
+        "- Compare different options with pros and cons\n"
+        "- Add your expert judgment: recommend the best approaches and explain WHY\n"
+        "- Include practical, actionable advice the reader can use immediately\n"
+        "- Use sub-headings (###) to organize if the topic has distinct sub-areas\n"
+        "- End with a brief recommendation for this specific topic\n\n"
+        "STRICT RULES:\n"
+        "- Do NOT write a brief 2-sentence paragraph — write DETAILED, LONG content\n"
+        "- Do NOT use generic advice like 'do your research' — be specific\n"
+        "- Do NOT include URLs, source references, or source IDs\n"
+        "- Do NOT repeat the section title in the first sentence\n"
+        "- Every paragraph must contain concrete, useful information\n\n"
+        f"## {section_title}\n"
+    )
+
+    try:
+        result = await ollama_generate(
+            prompt, ollama_base_url, model_name,
+            timeout=cfg.SECTION_WRITER_TIMEOUT, max_tokens=max_tokens, temperature=temperature,
+        )
+        return result.strip()
+    except Exception:
+        return ""
+
+
+async def _write_bookends(
+    task_text: str,
+    section_summaries: str,
+    criteria: list[str] | None,
+    ollama_base_url: str,
+    model_name: str,
+    temperature: float = cfg.SYNTHESIS_TEMPERATURE,
+    max_tokens: int = 4096,
+) -> tuple[str, str, str]:
+    """
+    Bookend writer: produces the executive summary, actionable recommendations,
+    and conclusion that tie the whole report together. Runs AFTER all sections
+    are written so it can summarize the actual content.
+    """
+    prompt = (
+        "You are finalizing a research report. Below are summaries of each section that was already written.\n\n"
+        f"RESEARCH QUESTION: {task_text}\n\n"
+        f"SECTIONS ALREADY WRITTEN:\n{section_summaries}\n\n"
+        "Now write THREE parts to complete the report:\n\n"
+        "EXECUTIVE SUMMARY:\n"
+        "Write 3-5 detailed paragraphs summarizing the key findings across ALL sections. "
+        "Highlight the most important discoveries, the best options found, and the top recommendations. "
+        "This should give a busy reader the full picture without reading the rest.\n\n"
+        "ACTIONABLE RECOMMENDATIONS:\n"
+        "Write a numbered list of 8-15 specific, concrete action steps the reader should take. "
+        "Each recommendation should include WHAT to do, HOW to do it, and specific tools or platforms. "
+        "Order from most important to least important.\n\n"
+        "CONCLUSION:\n"
+        "Write 2-3 paragraphs that tie everything together, highlight the most critical takeaways, "
+        "and provide forward-looking perspective. Be opinionated about what matters most.\n\n"
+        "Rules:\n"
+        "- Be SPECIFIC and CONCRETE — name tools, amounts, strategies\n"
+        "- Do NOT include URLs or source references\n"
+        "- Write for an intelligent reader who wants actionable depth\n"
+    )
+
+    try:
+        output = await ollama_generate(
+            prompt, ollama_base_url, model_name,
+            timeout=cfg.SYNTHESIS_TIMEOUT, max_tokens=max_tokens, temperature=temperature,
+        )
+    except Exception:
+        return ("Research findings are summarized in the sections below.", "", "")
+
+    buckets: dict[str, list[str]] = {"exec": [], "recs": [], "concl": []}
+    current = "exec"  # default to exec if model skips the header
+
+    for line in output.splitlines():
+        upper = line.strip().upper()
+        if upper.startswith("EXECUTIVE SUMMARY"):
+            current = "exec"
+            continue
+        elif upper.startswith("ACTIONABLE RECOMMENDATION"):
+            current = "recs"
+            continue
+        elif upper.startswith("CONCLUSION"):
+            current = "concl"
+            continue
+        buckets[current].append(line)
+
+    exec_summary = "\n".join(buckets["exec"]).strip()
+    recommendations = "\n".join(buckets["recs"]).strip()
+    conclusion = "\n".join(buckets["concl"]).strip()
+
+    return (exec_summary, recommendations, conclusion)
+
+
+async def _synthesize_final(
+    task_text: str,
+    extracts: list[str],
+    ollama_base_url: str,
+    model_name: str,
+    temperature: float = cfg.SYNTHESIS_TEMPERATURE,
+    max_tokens: int = cfg.SYNTHESIS_MAX_TOKENS,
+    criteria: list[str] | None = None,
+    analysis: str = "",
+    progress_callback: Any | None = None,
+) -> str:
+    """
+    Multi-agent report assembly: one writer per section + bookends.
+
+    Instead of one LLM call writing everything (producing thin content),
+    each section gets its own dedicated call, then a final call ties it together.
+    All calls are sequential — one at a time through the local Ollama instance.
+
+    progress_callback: optional async callable(label: str, detail: str) for trace logging.
+    """
+    all_extracts = "\n\n".join(a.strip() for a in extracts if a.strip())
+    per_section_tokens = min(max_tokens, cfg.SECTION_WRITER_MAX_TOKENS)
+
+    if not criteria:
+        # No criteria — single-call fallback
+        prompt = (
+            f"Write a comprehensive research report on: {task_text}\n\n"
+            f"FACTS:\n{all_extracts}\n\n"
+            "Write a DETAILED markdown report with multiple sections.\n"
+            "REPORT:\n"
+        )
+        try:
+            return await ollama_generate(
+                prompt, ollama_base_url, model_name,
+                timeout=cfg.SYNTHESIS_TIMEOUT, max_tokens=max_tokens, temperature=temperature,
+            )
+        except Exception:
+            return f"# {task_text}\n\n" + all_extracts
+
+    # ── Write each criterion section with its own dedicated agent ──
+    section_markdowns: list[str] = []
+    section_summaries: list[str] = []
+
+    for i, criterion in enumerate(criteria):
+        section_title = criterion[:120].rstrip(".,")
+
+        # Filter extracts to find facts relevant to this criterion
+        q_label = f"Q{i+1}"
+        relevant_parts: list[str] = []
+        other_parts: list[str] = []
+        for extract in extracts:
+            lines = extract.splitlines()
+            relevant_lines = []
+            other_lines = []
+            in_relevant = False
+            for line in lines:
+                if line.strip().upper().startswith(f"{q_label} FACTS") or line.strip().upper().startswith(f"{q_label}:"):
+                    in_relevant = True
+                    continue
+                elif re.match(r"^Q\d+ (FACTS|:)", line.strip(), re.I):
+                    in_relevant = False
+                elif line.strip().upper().startswith("OTHER RELEVANT"):
+                    in_relevant = False
+
+                if in_relevant and line.strip() and line.strip() != "- NONE":
+                    relevant_lines.append(line)
+                elif line.strip() and line.strip() != "- NONE":
+                    other_lines.append(line)
+
+            if relevant_lines:
+                relevant_parts.append("\n".join(relevant_lines))
+            if other_lines:
+                other_parts.append("\n".join(other_lines))
+
+        # If we couldn't filter, use all extracts
+        if not relevant_parts:
+            extracts_for_section = all_extracts[:8000]
+        else:
+            extracts_for_section = "\n\n".join(relevant_parts)
+            # Add some "other" context too
+            other_text = "\n".join(other_parts)[:2000]
+            if other_text:
+                extracts_for_section += f"\n\nADDITIONAL CONTEXT:\n{other_text}"
+
+        # Extract analysis relevant to this criterion
+        analysis_for_section = ""
+        if analysis:
+            crit_marker = f"CRITERION {i+1}"
+            lines = analysis.splitlines()
+            capture = False
+            captured: list[str] = []
+            for line in lines:
+                if crit_marker in line.upper():
+                    capture = True
+                    continue
+                elif capture and re.match(r"^CRITERION \d+", line.strip(), re.I):
+                    break
+                elif capture and line.strip().upper().startswith("OVERALL"):
+                    break
+                elif capture:
+                    captured.append(line)
+            analysis_for_section = "\n".join(captured).strip()
+
+        if progress_callback:
+            await progress_callback(
+                f"[SECTION {i+1}/{len(criteria)}] Writing: {section_title[:60]}",
+                f"Relevant facts: {len(extracts_for_section)} chars | Analysis: {len(analysis_for_section)} chars"
+            )
+
+        section_md = await _write_section(
+            task_text, section_title, extracts_for_section, analysis_for_section,
+            ollama_base_url, model_name, temperature=temperature, max_tokens=per_section_tokens,
+        )
+
+        if section_md.strip():
+            if not section_md.strip().startswith("##"):
+                section_md = f"## {section_title}\n\n{section_md}"
+            section_markdowns.append(section_md)
+            first_para = section_md.split("\n\n")[1] if "\n\n" in section_md else section_md[:200]
+            section_summaries.append(f"Section: {section_title}\nSummary: {first_para[:300]}")
+
+            if progress_callback:
+                await progress_callback(
+                    f"[SECTION {i+1}/{len(criteria)}] Done ({len(section_md)} chars)",
+                    section_md[:400]
+                )
+        else:
+            if progress_callback:
+                await progress_callback(
+                    f"[SECTION {i+1}/{len(criteria)}] Empty — section skipped",
+                    f"Topic: {section_title}"
+                )
+
+    if progress_callback:
+        await progress_callback(
+            "[BOOKENDS] Writing executive summary, recommendations, and conclusion",
+            f"Summarizing {len(section_markdowns)} completed sections"
+        )
+
+    summaries_text = "\n\n".join(section_summaries) if section_summaries else "No sections were written."
+    exec_summary, recommendations, conclusion = await _write_bookends(
+        task_text, summaries_text, criteria, ollama_base_url, model_name,
+        temperature=temperature, max_tokens=per_section_tokens,
+    )
+
+    # ── Assemble the full report ──
+    title_kw = task_text[:80].rstrip(".,!?")
+    parts = [f"# {title_kw}\n"]
+
+    if exec_summary:
+        parts.append(f"## Executive Summary\n\n{exec_summary}\n")
+
+    for section in section_markdowns:
+        parts.append(f"\n{section}\n")
+
+    if recommendations:
+        parts.append(f"\n## Actionable Recommendations\n\n{recommendations}\n")
+
+    if conclusion:
+        parts.append(f"\n## Conclusion\n\n{conclusion}\n")
+
+    return "\n".join(parts)
 
 
 def _clean_report_markdown(raw: str) -> str:
@@ -408,48 +777,72 @@ async def generate_structured_report(
     synthesis_max_tokens: int = cfg.SYNTHESIS_MAX_TOKENS,
     analyst_temperature: float = cfg.ANALYST_TEMPERATURE,
     analyst_max_tokens: int = cfg.ANALYST_MAX_TOKENS,
+    criteria: list[str] | None = None,
 ) -> tuple[StructuredReport, str]:
-    """Multi-agent synthesis: analysts extract, synthesizer combines, output is clean markdown."""
-    sources_with_ids = _source_ids(sources)
+    """
+    Per-source fact extraction → structured synthesis pipeline.
 
+    Stage 1: One fact-extractor agent per source (parallel, focused).
+             Each extracts criterion-specific bullets from a single source.
+    Stage 2: One synthesizer that combines all extracts into a grounded report.
+    """
+    sources_with_ids = _source_ids(sources)
     quality_order = {"good": 0, "medium": 1, "poor": 2}
     ranked = sorted(sources_with_ids, key=lambda s: quality_order.get(s.get("quality", "medium"), 1))
     top_sources = ranked[:top_sources_cap]
 
-    batch_size = analyst_batch_size
-    batches: list[list[dict[str, Any]]] = []
-    for i in range(0, len(top_sources), batch_size):
-        batches.append(top_sources[i:i + batch_size])
-
-    valid_analyses: list[str] = []
-    for i, batch in enumerate(batches):
+    # ── Stage 1: per-source fact extraction (sequential to avoid overloading local Ollama) ──
+    per_source_extracts: list[str] = []
+    for s in top_sources:
         try:
-            analysis = await _analyze_source_batch(task_text, batch, f"batch_{i+1}", ollama_base_url, model_name, temperature=analyst_temperature, max_tokens=analyst_max_tokens)
-            if isinstance(analysis, str) and len(analysis.strip()) > 20:
-                valid_analyses.append(analysis)
+            extract = await _extract_facts_from_source(
+                task_text, s, ollama_base_url, model_name,
+                temperature=analyst_temperature,
+                max_tokens=min(analyst_max_tokens, 2048),
+                criteria=criteria,
+            )
+            if isinstance(extract, str) and len(extract.strip()) > 20:
+                per_source_extracts.append(extract.strip())
         except Exception:
             pass
 
-    if not valid_analyses:
-        facts = []
-        for s in sources_with_ids[:8]:
+    if not per_source_extracts:
+        # Hard fallback: first sentences from each source
+        for s in top_sources[:6]:
             text = (s.get("content_text") or "")
-            sentences = [sent.strip() for sent in re.split(r"[.!?]\s+", text[:1500]) if len(sent.strip()) > 30]
+            sentences = [sent.strip() for sent in re.split(r"[.!?]\s+", text[:2000]) if len(sent.strip()) > 30]
             if sentences:
-                facts.append(sentences[0])
-        valid_analyses = ["\n".join(facts)] if facts else ["No usable information could be extracted from the sources."]
+                per_source_extracts.append("- " + "\n- ".join(sentences[:4]))
+        if not per_source_extracts:
+            per_source_extracts = ["No usable information could be extracted from the collected sources."]
 
-    # ── Stage 2: Final synthesis ──
-    raw_report = await _synthesize_final(task_text, valid_analyses, ollama_base_url, model_name, temperature=synthesis_temperature, max_tokens=synthesis_max_tokens)
+    # ── Stage 2: Deep analysis and judgment ──
+    analysis = await _analyze_and_judge(
+        task_text, per_source_extracts, ollama_base_url, model_name,
+        temperature=synthesis_temperature, max_tokens=min(synthesis_max_tokens, 4096),
+        criteria=criteria,
+    )
+
+    # ── Stage 3: Final synthesis (extracts + analysis → long report) ──
+    raw_report = await _synthesize_final(
+        task_text, per_source_extracts, ollama_base_url, model_name,
+        temperature=synthesis_temperature, max_tokens=synthesis_max_tokens,
+        criteria=criteria, analysis=analysis,
+    )
     clean_markdown = _clean_report_markdown(raw_report)
 
+    # Batches for findings/metadata (kept for StructuredReport building below)
+    batches: list[list[dict[str, Any]]] = []
+    for i in range(0, len(top_sources), analyst_batch_size):
+        batches.append(top_sources[i:i + analyst_batch_size])
+
     if len(clean_markdown) < 50:
-        clean_markdown = f"# {task_text}\n\n" + "\n\n".join(valid_analyses)
+        clean_markdown = f"# {task_text}\n\n" + "\n\n".join(per_source_extracts)
 
     # Build StructuredReport for internal storage
     findings = []
-    for i, analysis in enumerate(valid_analyses[:8], 1):
-        sentences = [s.strip() for s in re.split(r"[.!?]\s+", analysis[:500]) if len(s.strip()) > 20]
+    for i, extract in enumerate(per_source_extracts[:8], 1):
+        sentences = [s.strip() for s in re.split(r"[.!?]\s+", extract[:500]) if len(s.strip()) > 20]
         if sentences:
             batch_idx = min(i - 1, len(batches) - 1)
             src_ids = [s["source_id"] for s in batches[batch_idx]]

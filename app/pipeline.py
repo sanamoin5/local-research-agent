@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,9 +14,10 @@ from .repository import Repository
 from .schemas import Event, Settings, TaskPlan
 from .reporting import (
     StructuredReport,
-    _analyze_source_batch,
+    _analyze_and_judge,
     _clean_report_markdown,
     _direct_synthesis,
+    _extract_facts_from_source,
     _source_ids,
     _synthesize_final,
     build_limitations_seed,
@@ -289,10 +291,12 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
     await _trace("info", f"Goal: {goal}", f"Success criteria:\n" + "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1)))
     await bus.emit(task_id, "step_started", {"step": "autonomous_loop", "message": "Starting autonomous research loop"})
 
+    consecutive_empty = 0  # counts iterations that found zero new sources
+
     for iteration in range(1, max_iterations + 1):
         await _trace("info", f"══ Iteration {iteration}/{max_iterations} ══", f"Sources so far: {len(usable_sources)} | Skipped: {skipped_sources}")
 
-        # ── UNIFIED THINK: thoughts + reasoning + criticism + action decision ──
+        # ── UNIFIED THINK: analysis + action decision ──
         knowledge = build_knowledge_summary(usable_sources)
         await _trace("model_call", f"[THINK] Autonomous reasoning (iter {iteration})",
                       f"Feeding observation from last round into the thinker...")
@@ -320,31 +324,38 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
 
         good_sources = [s for s in usable_sources if s.get("quality") == "good"]
         min_to_complete = cfg.MIN_SOURCES_TO_COMPLETE if not good_sources else cfg.MIN_SOURCES_TO_COMPLETE_WITH_GOOD
+
+        # COMPLETE if: agent decided so with enough sources, OR stuck with enough sources
         if step["action"] == "COMPLETE" and len(usable_sources) >= min_to_complete:
             await _trace("info", f"Agent decided COMPLETE at iteration {iteration} ({len(usable_sources)} sources, {len(good_sources)} good) — proceeding to synthesis")
+            break
+
+        if consecutive_empty >= cfg.MAX_CONSECUTIVE_EMPTY_ROUNDS and len(usable_sources) >= min_to_complete:
+            await _trace("info", f"[STUCK] No new sources for {consecutive_empty} consecutive rounds with {len(usable_sources)} sources — moving to synthesis")
             break
 
         # ── ACT: search + fetch ──
         queries = step["queries"]
 
-        # Guard: if all queries are duplicates of history, force novel queries
+        # Guard: strip near-duplicates (e.g. "topic guide 3" when "topic guide 2" already searched)
+        def _query_stem(q: str) -> str:
+            return re.sub(r"\s+\d+$", "", q.lower().strip())
+
+        history_stems = {_query_stem(q) for q in search_history}
         history_lower = {q.lower() for q in search_history}
-        novel = [q for q in queries if q.lower() not in history_lower]
+        novel = [q for q in queries if q.lower() not in history_lower and _query_stem(q) not in history_stems]
+
         if not novel and queries:
-            await _trace("warning", f"[GUARD] All {len(queries)} queries are duplicates — generating fresh angles")
-            from .services import generate_gap_queries, _extract_keywords
-            gap_queries = await generate_gap_queries(
-                task_text,
-                [s.get("title", "") for s in usable_sources],
-                config.ollama_base_url, settings.model_name,
-            )
-            gap_queries = [q for q in gap_queries if q.lower() not in history_lower]
-            if gap_queries:
-                queries = gap_queries[:3]
-            else:
-                kw = _extract_keywords(task_text)
-                queries = [f"{kw} tips", f"{kw} examples", f"{kw} regulations"]
-                queries = [q for q in queries if q.lower() not in history_lower][:2]
+            await _trace("warning", f"[GUARD] All {len(queries)} queries are duplicates or near-duplicates — generating fresh criteria-based angles")
+            from .services import _criteria_fallback_queries
+            queries = _criteria_fallback_queries(criteria, search_history, iteration, task_text)
+            queries = [q for q in queries if q.lower() not in history_lower and _query_stem(q) not in history_stems]
+
+        if not queries:
+            await _trace("warning", f"[GUARD] Could not generate any novel queries at iter {iteration} — skipping search")
+            consecutive_empty += 1
+            await asyncio.sleep(settings.inter_iteration_cooldown)
+            continue
 
         await _trace("info", f"[ACT] Executing {len(queries)} searches")
         new_count = await _search_and_fetch(queries, iteration)
@@ -356,6 +367,7 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
         quality_summary = f"Quality breakdown: {good_count} good, {med_count} medium"
 
         if new_count > 0:
+            consecutive_empty = 0
             new_snippets = [
                 f"- ({s.get('quality', '?')}) {s.get('title', '?')[:50]}: {(s.get('content_text') or '')[:cfg.OBSERVATION_SNIPPET_LENGTH].strip()}"
                 for s in usable_sources[-new_count:]
@@ -365,12 +377,14 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
                 f"New sources:\n" + "\n".join(new_snippets[:6])
             )
         elif len(usable_sources) > 0:
+            consecutive_empty += 1
             last_observation = (
                 f"No NEW sources found this round (searches returned duplicates or low-quality pages). "
                 f"Total usable: {len(usable_sources)}, skipped: {skipped_sources}. {quality_summary}. "
-                f"Try completely different search angles or more specific terms."
+                f"Try COMPLETELY DIFFERENT angles — focus on criteria not yet covered."
             )
         else:
+            consecutive_empty += 1
             last_observation = (
                 f"Still no usable sources after {iteration} iterations. "
                 f"All {skipped_sources} pages were low quality or failed to fetch. "
@@ -430,13 +444,15 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
     detailed_findings_md = ""
 
     if strategy == "DIRECT":
-        # ── DIRECT: single focused synthesis call ──
-        await _trace("model_call", "[WRITER] Single-pass report generation",
-                      f"Writing report directly from {len(top_sources)} sources (focused topic)")
+        # ── DIRECT: multi-section report from sources ──
+        n_criteria_d = len(criteria) if criteria else 0
+        await _trace("model_call", f"[WRITER] Direct multi-section report ({n_criteria_d} sections)",
+                      f"Writing report from {len(top_sources)} sources (focused topic)")
         raw_report = await _direct_synthesis(
             task_text, top_sources, config.ollama_base_url, settings.model_name,
             temperature=settings.synthesis_temperature,
             max_tokens=settings.synthesis_max_tokens,
+            criteria=criteria,
         )
         clean_markdown = _clean_report_markdown(raw_report)
         detailed_findings_md = clean_markdown
@@ -447,70 +463,91 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
                       clean_markdown[:600])
 
     else:
-        # ── MULTI_AGENT: themed analysts + synthesizer ──
+        # ── MULTI_AGENT: one fact-extractor per source + one synthesizer ──
+        batches = []
         if groups:
-            batches = []
             for g in groups:
                 batch = [top_sources[i] for i in g["indices"] if i < len(top_sources)]
                 if batch:
                     batches.append(batch)
         else:
-            batches = []
             for bi in range(0, len(top_sources), cfg.ANALYST_BATCH_SIZE):
                 batches.append(top_sources[bi:bi + cfg.ANALYST_BATCH_SIZE])
 
-        num_batches = len(batches)
-        await _trace("info", f"[MULTI_AGENT] {num_batches} themed analyst agents + 1 synthesizer")
+        await _trace("info", f"[MULTI_AGENT] {len(top_sources)} fact-extractor agents (1 per source) + 1 synthesizer")
 
-        valid_analyses: list[str] = []
-        for bi, batch in enumerate(batches):
-            theme = groups[bi]["theme"] if bi < len(groups) else f"batch {bi+1}"
-            titles = [s.get("title", "?")[:50] for s in batch]
-            await _trace("model_call", f"[ANALYST {bi+1}/{num_batches}] Theme: {theme}",
-                          "Sources:\n" + "\n".join(f"  - {t}" for t in titles))
+        per_source_extracts: list[str] = []
+        for si, source in enumerate(top_sources, 1):
+            title = source.get("title", "?")[:60]
+            await _trace("model_call", f"[EXTRACTOR {si}/{len(top_sources)}] {title}",
+                          f"Extracting criterion-specific facts from source")
             try:
-                analysis = await _analyze_source_batch(
-                    task_text, batch, theme,
+                extract = await _extract_facts_from_source(
+                    task_text, source,
                     config.ollama_base_url, settings.model_name,
                     temperature=settings.synthesis_temperature,
-                    max_tokens=settings.synthesis_max_tokens,
+                    max_tokens=min(settings.synthesis_max_tokens, 2048),
+                    criteria=criteria,
                 )
-                if isinstance(analysis, str) and len(analysis.strip()) > 20:
-                    valid_analyses.append(analysis)
-                    await _trace("model_result", f"[ANALYST {bi+1}] {theme} — insights extracted",
-                                  analysis[:500])
+                if isinstance(extract, str) and len(extract.strip()) > 20:
+                    per_source_extracts.append(extract.strip())
+                    await _trace("model_result", f"[EXTRACTOR {si}] {title} — facts extracted",
+                                  extract[:400])
                 else:
-                    await _trace("warning", f"[ANALYST {bi+1}] {theme} — no useful insights")
+                    await _trace("warning", f"[EXTRACTOR {si}] {title} — no useful facts")
             except Exception as exc:
-                await _trace("warning", f"[ANALYST {bi+1}] {theme} — failed: {exc.__class__.__name__}")
+                await _trace("warning", f"[EXTRACTOR {si}] {title} — failed: {exc.__class__.__name__}")
 
-        if not valid_analyses:
-            import re as _re
+        if not per_source_extracts:
             facts = []
             for s in top_sources[:8]:
                 text = (s.get("content_text") or "")
-                sentences = [sent.strip() for sent in _re.split(r"[.!?]\s+", text[:1500]) if len(sent.strip()) > 30]
+                sentences = [sent.strip() for sent in re.split(r"[.!?]\s+", text[:1500]) if len(sent.strip()) > 30]
                 if sentences:
-                    facts.append(sentences[0])
-            valid_analyses = ["\n".join(facts)] if facts else ["No usable information could be extracted."]
+                    facts.append("- " + "\n- ".join(sentences[:3]))
+            per_source_extracts = facts if facts else ["No usable information could be extracted."]
 
-        # Build detailed findings markdown — raw concatenation of all analyst outputs
+        # Detailed findings: raw concatenation of per-source extracts
         findings_parts = []
-        for ai, analysis in enumerate(valid_analyses):
-            theme = groups[ai]["theme"] if ai < len(groups) else f"Analysis {ai+1}"
-            findings_parts.append(f"## {theme}\n\n{analysis.strip()}")
+        for si, extract in enumerate(per_source_extracts):
+            src_title = top_sources[si]["title"][:60] if si < len(top_sources) else f"Source {si+1}"
+            findings_parts.append(f"## {src_title}\n\n{extract.strip()}")
         detailed_findings_md = "\n\n---\n\n".join(findings_parts)
 
-        await _trace("model_call", f"[SYNTHESIZER] Combining {len(valid_analyses)} themed analyses into final report")
+        # ── ANALYSIS: deep comparison, judgment, recommendations ──
+        await _trace("model_call", f"[ANALYST] Deep analysis of {len(per_source_extracts)} source extracts — comparing, judging, recommending")
+        analysis = await _analyze_and_judge(
+            task_text, per_source_extracts, config.ollama_base_url, settings.model_name,
+            temperature=settings.synthesis_temperature,
+            max_tokens=min(settings.synthesis_max_tokens, 4096),
+            criteria=criteria,
+        )
+        if analysis.strip():
+            await _trace("model_result", "[ANALYST] Expert analysis complete", analysis[:600])
+        else:
+            await _trace("warning", "[ANALYST] Analysis returned empty — synthesizer will work from extracts only")
+
+        # ── SYNTHESIS: per-section writers + bookends → long comprehensive report ──
+        n_criteria = len(criteria) if criteria else 0
+        await _trace("model_call",
+                      f"[SYNTHESIZER] Writing {n_criteria} sections + bookends from {len(per_source_extracts)} extracts + expert analysis",
+                      "Each section gets its own dedicated writer agent for maximum depth")
+
+        async def _synth_progress(label: str, detail: str) -> None:
+            await _trace("model_result", label, detail)
+
         raw_report = await _synthesize_final(
-            task_text, valid_analyses, config.ollama_base_url, settings.model_name,
+            task_text, per_source_extracts, config.ollama_base_url, settings.model_name,
             temperature=settings.synthesis_temperature,
             max_tokens=settings.synthesis_max_tokens,
+            criteria=criteria,
+            analysis=analysis,
+            progress_callback=_synth_progress,
         )
         clean_markdown = _clean_report_markdown(raw_report)
         synthesis_mode = "multi_agent"
 
-        await _trace("model_result", f"[SYNTHESIZER] Report complete",
+        await _trace("model_result", f"[SYNTHESIZER] Report complete ({len(clean_markdown)} chars)",
                       clean_markdown[:600])
 
     if len(clean_markdown) < 50:

@@ -104,9 +104,23 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
 @app.post("/api/tasks")
 async def create_task(payload: TaskCreate) -> dict[str, Any]:
     settings = repo.get_settings()
-    plan, plan_mode = await generate_plan(payload.task, OLLAMA_BASE_URL, settings.model_name)
+    planning_result = await generate_plan(payload.task, OLLAMA_BASE_URL, settings.model_name)
+    plan = planning_result.plan
+    plan_mode = planning_result.mode
+
     task_id = repo.create_task(payload.task, settings, plan.model_dump())
     repo.set_plan(task_id, plan.model_dump(), "pending")
+
+    # Store each planning agent's trace so the user can see the thinking
+    for pt in planning_result.traces:
+        repo.add_trace(task_id, "model_result", pt.label, pt.detail)
+        await bus.emit(task_id, "trace", {
+            "trace_type": "model_result",
+            "label": pt.label,
+            "detail": pt.detail,
+        })
+
+    # Summary trace
     criteria_text = "\n".join(f"  ✓ {c}" for c in plan.success_criteria) if plan.success_criteria else "  (default criteria)"
     plan_detail = f"Goal: {plan.goal}\n\nSuccess Criteria:\n{criteria_text}\n\nSteps:\n" + "\n".join(f"  {s.step_number}. {s.description}" for s in plan.steps)
     repo.add_trace(task_id, "model_result", f"Research plan generated ({plan_mode})", plan_detail)

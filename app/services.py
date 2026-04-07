@@ -343,22 +343,56 @@ def build_knowledge_summary(sources: list[dict[str, Any]], max_chars: int = cfg.
 
 
 async def formulate_goal(task_text: str, base_url: str, model: str) -> dict[str, Any]:
-    """Parse a user's request into a clear goal with measurable success criteria."""
+    """
+    Parse a user's request into a clear research goal with 4-5 specific, searchable
+    research angles. Each angle becomes:
+      - a search direction for the autonomous loop
+      - a fact-extraction question per source
+      - a dedicated section in the final report
+    So they must be *distinct topics you can actually Google*.
+    """
     prompt = (
-        "You are a research goal analyst. Convert this request into a clear, measurable research goal.\n\n"
-        f"Request: {task_text}\n\n"
-        "Write EXACTLY this format:\n"
-        "GOAL: (one sentence — what does a complete answer look like?)\n"
+        "You are a research planner. A user wants you to research something. "
+        "Break their request into 4-5 DISTINCT research angles that can be searched on Google.\n\n"
+        f"USER REQUEST: {task_text}\n\n"
+        "=== EXAMPLE 1 ===\n"
+        "Request: 'I want to build wealth. I'm an AI engineer and want to build a business'\n"
+        "GOAL: Research practical wealth-building paths for AI engineers — startup ideas, investing, and side businesses.\n"
         "CRITERIA:\n"
-        "- (first specific thing that must be found or confirmed)\n"
-        "- (second specific criterion)\n"
-        "- (third specific criterion)\n"
-        "- (optional fourth criterion)\n\n"
-        "Be SPECIFIC. Each criterion should be something you can check.\n"
-        "Each criterion must be SHORT (under 30 words) and testable.\n"
+        "- AI startup and SaaS business ideas that leverage machine learning engineering skills\n"
+        "- Passive income and investment strategies for high-earning tech professionals\n"
+        "- Freelancing, consulting, and productized service businesses for AI/ML engineers\n"
+        "- Real examples of software engineers who built wealth through side businesses or startups\n"
+        "- Financial planning fundamentals: saving rate, compound growth, and tax optimization for tech workers\n\n"
+        "=== EXAMPLE 2 ===\n"
+        "Request: 'Build a single page digital professional card'\n"
+        "GOAL: Find the best tools, templates, and design practices for creating a one-page digital professional card.\n"
+        "CRITERIA:\n"
+        "- Website builders for single-page portfolio cards: Carrd, Linktree, About.me, Bento comparison\n"
+        "- UX and layout best practices for one-page professional profiles\n"
+        "- Pre-designed templates and themes for digital business cards or portfolio pages\n"
+        "- Interactive and multimedia features that make digital cards stand out: NFC, QR, animations\n\n"
+        "=== NOW YOUR TURN ===\n"
+        "Write the GOAL and CRITERIA for the actual USER REQUEST above.\n\n"
+        "GOAL: [one clear sentence — what does a complete research result look like?]\n"
+        "CRITERIA:\n"
+        "- [research angle 1 — a specific, searchable topic with named subtopics]\n"
+        "- [research angle 2 — different angle, not a rephrasing of angle 1]\n"
+        "- [research angle 3 — covers a new aspect]\n"
+        "- [research angle 4 — yet another distinct angle]\n\n"
+        "RULES:\n"
+        "- Each criterion is a TOPIC to search, not a task to do\n"
+        "- Name specific subtopics, tools, or concepts in each criterion\n"
+        "- Each criterion must be DIFFERENT from the others — cover distinct ground\n"
+        "- Do NOT just repeat or rephrase the user's request\n"
+        "- Think: what would you actually type into Google to research each angle?\n"
     )
     try:
-        output = await ollama_generate(prompt, base_url, model, temperature=cfg.GOAL_TEMPERATURE)
+        output = await ollama_generate(
+            prompt, base_url, model,
+            temperature=cfg.GOAL_TEMPERATURE,
+            max_tokens=600,
+        )
         goal = ""
         criteria: list[str] = []
         in_criteria = False
@@ -368,23 +402,30 @@ async def formulate_goal(task_text: str, base_url: str, model: str) -> dict[str,
             if upper.startswith("GOAL:"):
                 goal = stripped[5:].strip()
                 in_criteria = False
-            elif upper.startswith("CRITERIA"):
+            elif upper.startswith("CRITERIA") or upper.startswith("CRITERION"):
                 in_criteria = True
                 continue
-            elif in_criteria:
-                # Accept: "- item", "* item", "• item", "1. item", "1) item"
-                cleaned = re.sub(r"^(\d+[.)]\s*|[-*•·]\s*)", "", stripped)
-                if len(cleaned) > 10:
-                    criteria.append(cleaned.rstrip("."))
+            elif in_criteria and stripped:
+                cleaned = re.sub(r"^(\d+[.):\-]\s*|[-*•·]\s*)", "", stripped)
+                cleaned = cleaned.strip().rstrip(".")
+                if len(cleaned) < 15:
+                    continue
+                # Reject if the criterion is just the raw task echoed back
+                if cleaned.lower()[:40] == task_text.lower()[:40]:
+                    continue
+                criteria.append(cleaned)
+
         if not goal:
             goal = task_text[:300]
+
         if not criteria:
-            criteria = [f"Find comprehensive, detailed information about: {task_text[:100]}"]
+            criteria = _generate_fallback_criteria(task_text)
+
         return {"goal": goal[:400], "criteria": criteria[:6]}
     except Exception:
         return {
             "goal": task_text[:300],
-            "criteria": [f"Find comprehensive information about: {task_text[:100]}"],
+            "criteria": _generate_fallback_criteria(task_text),
         }
 
 
@@ -400,6 +441,10 @@ def _extract_keywords(text: str, max_words: int = 6) -> str:
         "professional", "good", "best", "effective", "should", "need",
         "sample", "request", "letter", "potential", "future", "conveying",
         "expressing", "expectation", "immediate", "services", "cooperation",
+        "want", "build", "like", "just", "use", "get", "give", "know",
+        "think", "need", "currently", "looking", "trying", "help", "going",
+        "am", "im", "ve", "re", "ll", "have", "has", "had", "would", "could",
+        "some", "more", "any", "all", "other", "own", "same", "such",
     }
     words = re.findall(r"[a-zA-Z]{2,}", text.lower())
     keywords = [w for w in words if w not in stop]
@@ -410,6 +455,63 @@ def _extract_keywords(text: str, max_words: int = 6) -> str:
         if len(seen) >= max_words:
             break
     return " ".join(seen) if seen else text[:50]
+
+
+def _generate_fallback_criteria(task_text: str) -> list[str]:
+    """
+    When the LLM can't generate criteria, build plausible research angles from
+    keywords in the task text. These should read like things you'd actually Google.
+    """
+    kw = _extract_keywords(task_text, max_words=4)
+    return [
+        f"Best strategies and proven methods for {kw}",
+        f"Real-world examples and case studies of {kw}",
+        f"Tools, platforms, and resources for {kw}",
+        f"Common mistakes and pitfalls to avoid with {kw}",
+    ]
+
+
+def _criteria_fallback_queries(
+    criteria: list[str],
+    search_history: list[str],
+    iteration: int,
+    goal: str,
+) -> list[str]:
+    """
+    Build diverse fallback queries from success criteria when the LLM fails.
+    Rotates through criteria so each iteration targets a different unsatisfied criterion.
+    """
+    seen_lower = {h.lower() for h in search_history}
+    queries: list[str] = []
+
+    # Try each criterion as a keyword query, rotating start index by iteration
+    for offset in range(len(criteria)):
+        idx = (iteration - 1 + offset) % len(criteria)
+        kw = _extract_keywords(criteria[idx], max_words=5)
+        if kw and kw.lower() not in seen_lower:
+            queries.append(kw)
+        if len(queries) >= 3:
+            break
+
+    # If criteria all duped, try topic + angle combos
+    if not queries:
+        base = _extract_keywords(goal, max_words=3)
+        angles = [
+            "best tools platforms",
+            "design tips examples",
+            "how to build",
+            "templates comparison",
+            "step by step tutorial",
+            "features checklist",
+        ]
+        for angle in angles:
+            q = f"{base} {angle}"
+            if q.lower() not in seen_lower:
+                queries.append(q)
+            if queries:
+                break
+
+    return queries[:3]
 
 
 async def autonomous_step(
@@ -424,69 +526,63 @@ async def autonomous_step(
     temperature: float = cfg.REASONING_TEMPERATURE,
 ) -> dict[str, Any]:
     """
-    Unified Auto-GPT style thinking step.
-    One call produces: THOUGHTS → REASONING → PLAN → CRITICISM → ACTION.
-    The model reflects on what it researched, critiques itself, then decides
-    whether to SEARCH more or COMPLETE.
+    Unified thinking step: reflect on what was found, decide to SEARCH or COMPLETE.
+    Uses a simplified 3-section format (ANALYSIS / ACTION / QUERIES) that small
+    local models can reliably follow instead of the heavier 5-section layout.
     """
-    criteria_text = "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1))
-    history_text = "\n".join(f"  - {q}" for q in search_history[-10:]) if search_history else "  (none yet)"
+    criteria_text = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(criteria))
+    history_text = "\n".join(f"  - {q}" for q in search_history[-12:]) if search_history else "  (none yet)"
 
     prompt = (
-        "You are an autonomous research agent. You operate in a loop: think, search the web, observe results, repeat.\n\n"
-        f"GOAL: {goal}\n\n"
-        f"SUCCESS CRITERIA:\n{criteria_text}\n\n"
-        f"WHAT I HAVE COLLECTED SO FAR:\n{knowledge_summary}\n\n"
-        f"SEARCHES ALREADY TRIED:\n{history_text}\n\n"
-        f"LAST OBSERVATION:\n{last_observation}\n\n"
-        "Now respond in EXACTLY this format (use these exact headers):\n\n"
-        "THOUGHTS: Analyze what I found so far. What is useful? What is missing? How close am I to meeting each criterion?\n\n"
-        "REASONING: Why am I taking my next action? What angle or gap am I targeting?\n\n"
-        "PLAN:\n1. (immediate next step)\n2. (step after that)\n3. (further steps)\n\n"
-        "CRITICISM: Be harsh with yourself. What are you missing? What could go wrong? Is your research thorough enough? Are you being lazy?\n\n"
-        "ACTION: SEARCH or COMPLETE\n"
-        "(choose COMPLETE only if ALL criteria are well-satisfied with strong evidence)\n"
-        "(choose SEARCH if ANY criterion still needs more evidence)\n\n"
+        "You are an autonomous research agent running an iterative web research loop.\n\n"
+        f"RESEARCH GOAL: {goal}\n\n"
+        f"CRITERIA TO SATISFY (you must gather evidence for EACH):\n{criteria_text}\n\n"
+        f"KNOWLEDGE GATHERED SO FAR:\n{knowledge_summary}\n\n"
+        f"SEARCHES ALREADY TRIED (do NOT repeat these):\n{history_text}\n\n"
+        f"LAST ROUND RESULTS:\n{last_observation}\n\n"
+        "Now respond in EXACTLY this 3-section format:\n\n"
+        "ANALYSIS: (2-3 sentences) Which criteria have evidence? Which are still missing? What gaps remain?\n\n"
+        "ACTION: SEARCH\n\n"
         "QUERIES:\n"
-        "(if SEARCH: write 3-4 SHORT web search queries, one per line)\n"
-        "(if COMPLETE: write \"ready to synthesize\")\n\n"
-        "CRITICAL RULES FOR QUERIES:\n"
-        "- Each query MUST be 3-7 words, keyword-style like a Google search\n"
-        "- Queries search FOR INFORMATION, they are NOT instructions or tasks\n"
-        "- Do NOT write the goal or task as a query — break it into searchable topics\n"
-        "- Do NOT copy or rephrase previous queries\n"
-        "- Do NOT use verbs like 'develop', 'write', 'create', 'find', 'search' at the start\n"
-        "Examples for good or bad queries when asked to help in creating a letter of intent for belgium for a freelance professional card:"
-        "- GOOD queries: noun phrases, topics, terms — things you'd type into Google\n"
-        "- GOOD: letter of intent Belgian agency template\n"
-        "- GOOD: freelance professional card Belgium requirements\n"
-        "- GOOD: neutral tone business correspondence Belgium\n"
-        "- BAD: Develop a letter for Belgian agency cooperation\n"
-        "- BAD: Write a sample letter that requests letter of intent\n"
-        "- BAD: Find information about freelance cards in Belgium\n"
+        "query one here\n"
+        "query two here\n"
+        "query three here\n\n"
+        "RULES FOR QUERIES:\n"
+        "- Write 3-4 queries, each on its own line\n"
+        "- Each query: 3-6 words, keyword-style (like typing into Google)\n"
+        "- Each query must target a DIFFERENT unsatisfied criterion\n"
+        "- Do NOT repeat or rephrase any previous search\n"
+        "- Do NOT use sentences or instructions — only noun phrases and keywords\n"
+        "- Only write ACTION: COMPLETE (instead of SEARCH) when ALL criteria have strong evidence\n"
+        "\nExample output for a goal about digital professional cards:\n"
+        "ANALYSIS: Found examples of digital cards and design tips. Still missing info on specific website builders and pre-built templates.\n"
+        "ACTION: SEARCH\n"
+        "QUERIES:\n"
+        "Carrd Linktree professional portfolio builder\n"
+        "digital business card templates customizable\n"
+        "single page portfolio UX best practices\n"
     )
 
     try:
         output = await ollama_generate(prompt, base_url, model, temperature=temperature)
     except Exception:
-        kw = _extract_keywords(goal)
         return {
             "thoughts": "Model call failed",
             "reasoning": "", "plan": "", "criticism": "",
             "action": "SEARCH",
-            "queries": [kw],
+            "queries": _criteria_fallback_queries(criteria, search_history, iteration, goal),
             "raw": "",
         }
 
     sections: dict[str, str] = {}
     current_key = "preamble"
     current_lines: list[str] = []
-    # Flexible matching: accept common variations of section headers
     header_map = {
+        "ANALYSIS": "thoughts",
         "THOUGHTS": "thoughts",
         "THOUGHT": "thoughts",
-        "REASONING": "reasoning",
-        "REASON": "reasoning",
+        "REASONING": "thoughts",
+        "REASON": "thoughts",
         "PLAN": "plan",
         "CRITICISM": "criticism",
         "CRITIQUE": "criticism",
@@ -523,11 +619,9 @@ async def autonomous_step(
     if action == "SEARCH":
         query_text = sections.get("queries", "") or sections.get("action_input", "")
 
-        # Fallback: if no QUERIES section, try lines after ACTION as implicit queries
         if not query_text.strip():
             action_section = sections.get("action", "")
             action_lines = action_section.splitlines()
-            # First line is "SEARCH", remaining lines may be queries
             if len(action_lines) > 1:
                 query_text = "\n".join(action_lines[1:])
 
@@ -535,28 +629,15 @@ async def autonomous_step(
             q = _clean_query(line)
             if 5 <= len(q) <= 200:
                 queries.append(q)
-        # Dedup against search history
         seen = {h.lower() for h in search_history}
         queries = [q for q in queries if q.lower() not in seen]
 
-    # Fallback: if no usable queries, extract keywords from goal + criteria
     if action == "SEARCH" and not queries:
-        kw = _extract_keywords(goal)
-        criteria_kw = _extract_keywords(" ".join(criteria[:2]), max_words=4) if criteria else ""
-        fallback = []
-        if kw:
-            fallback.append(kw)
-        if criteria_kw and criteria_kw != kw:
-            fallback.append(criteria_kw)
-        seen_lower = {h.lower() for h in search_history}
-        fallback = [q for q in fallback if q.lower() not in seen_lower]
-        if not fallback:
-            fallback = [f"{kw} guide {iteration}"]
-        queries = fallback
+        queries = _criteria_fallback_queries(criteria, search_history, iteration, goal)
 
     return {
         "thoughts": sections.get("thoughts", "")[:800],
-        "reasoning": sections.get("reasoning", "")[:400],
+        "reasoning": sections.get("reasoning", sections.get("thoughts", ""))[:400],
         "plan": sections.get("plan", "")[:400],
         "criticism": sections.get("criticism", "")[:400],
         "action": action,

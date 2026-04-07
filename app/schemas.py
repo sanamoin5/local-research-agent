@@ -19,16 +19,16 @@ class TaskCreate(BaseModel):
 
 
 class PlanStep(BaseModel):
-    step_number: int = Field(ge=1, le=20)
+    step_number: int = Field(ge=1, le=30)
     step_type: StepType
-    description: str = Field(min_length=4, max_length=240)
+    description: str = Field(min_length=4, max_length=500)
     dependencies: list[int] = Field(default_factory=list)
 
 
 class TaskPlan(BaseModel):
-    goal: str = Field(min_length=3, max_length=400)
+    goal: str = Field(min_length=3, max_length=600)
     success_criteria: list[str] = Field(default_factory=list)
-    steps: list[PlanStep] = Field(min_length=1, max_length=12)
+    steps: list[PlanStep] = Field(min_length=1, max_length=25)
 
     @field_validator("steps")
     @classmethod
@@ -52,7 +52,7 @@ class SettingsUpdate(BaseModel):
     cache_enabled: bool | None = None
     reasoning_temperature: float | None = Field(default=None, ge=0.0, le=1.0)
     synthesis_temperature: float | None = Field(default=None, ge=0.0, le=1.0)
-    synthesis_max_tokens: int | None = Field(default=None, ge=512, le=32768)
+    synthesis_max_tokens: int | None = Field(default=None, ge=512, le=65536)
     top_sources_cap: int | None = Field(default=None, ge=1, le=30)
     inter_query_delay: float | None = Field(default=None, ge=0.0, le=30.0)
     inter_iteration_cooldown: float | None = Field(default=None, ge=0.0, le=60.0)
