@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .diagnostics import run_diagnostics
 from .executor import AgentExecutor
 from .logging_utils import configure_logging, log_event, recent_logs
+from .config import PLAN_AUTO_CONFIRM_SECONDS
 from .pipeline import EventBus, RunConfig, health_report, run_direct_pipeline, set_runtime
 from .planner import generate_plan
 from .repository import Repository
@@ -130,18 +131,17 @@ async def create_task(payload: TaskCreate) -> dict[str, Any]:
         "detail": plan_detail,
     })
     await bus.emit(task_id, "plan_created", {"plan_mode": plan_mode, "plan": plan.model_dump()})
-    await bus.emit(task_id, "plan_waiting_confirmation", {"task_id": task_id})
+    await bus.emit(task_id, "plan_waiting_confirmation", {
+        "task_id": task_id,
+        "auto_confirm_seconds": PLAN_AUTO_CONFIRM_SECONDS,
+    })
+
+    asyncio.create_task(_auto_confirm_timer(task_id))
     return {"task_id": task_id, "status": "planning", "plan": plan.model_dump()}
 
 
-@app.post("/api/tasks/{task_id}/confirm")
-async def confirm_task(task_id: str) -> dict[str, str]:
-    task = repo.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="task not found")
-    if task.get("plan_status") != "pending":
-        return {"task_id": task_id, "status": task["status"]}
-
+async def _start_pipeline(task_id: str) -> None:
+    """Approve the plan and kick off the research pipeline."""
     repo.approve_plan(task_id)
     await bus.emit(task_id, "plan_confirmed", {"task_id": task_id})
 
@@ -164,6 +164,32 @@ async def confirm_task(task_id: str) -> dict[str, str]:
                 await bus.close(task_id)
 
     asyncio.create_task(guarded_run())
+
+
+async def _auto_confirm_timer(task_id: str) -> None:
+    """Wait PLAN_AUTO_CONFIRM_SECONDS, then auto-confirm if still pending."""
+    await asyncio.sleep(PLAN_AUTO_CONFIRM_SECONDS)
+    task = repo.get_task(task_id)
+    if not task or task.get("plan_status") != "pending":
+        return
+    repo.add_trace(task_id, "info", f"Auto-confirming plan after {PLAN_AUTO_CONFIRM_SECONDS}s timeout", "")
+    await bus.emit(task_id, "trace", {
+        "trace_type": "info",
+        "label": f"Auto-confirming plan after {PLAN_AUTO_CONFIRM_SECONDS}s timeout",
+        "detail": "",
+    })
+    await _start_pipeline(task_id)
+
+
+@app.post("/api/tasks/{task_id}/confirm")
+async def confirm_task(task_id: str) -> dict[str, str]:
+    task = repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.get("plan_status") != "pending":
+        return {"task_id": task_id, "status": task["status"]}
+
+    await _start_pipeline(task_id)
     return {"task_id": task_id, "status": "running"}
 
 

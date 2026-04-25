@@ -70,6 +70,44 @@ MIN_SOURCES_TO_COMPLETE = 3
 MIN_SOURCES_TO_COMPLETE_WITH_GOOD = 2
 MAX_CONSECUTIVE_EMPTY_ROUNDS = 3
 
+# ── Autonomous loop agents ─────────────────────────────────────
+# All 5 agents run every iteration (except REFLECT skipped on iter 1).
+# All calls are SEQUENTIAL — one at a time through local Ollama.
+# Timeouts generous — we don't care about wall-clock time.
+
+REFLECT_TEMPERATURE = 0.4
+REFLECT_TIMEOUT = 600
+REFLECT_MAX_TOKENS = 2000
+
+CHALLENGE_TEMPERATURE = 0.5
+CHALLENGE_TIMEOUT = 600
+CHALLENGE_MAX_TOKENS = 1200
+
+DISCOVER_TEMPERATURE = 0.6
+DISCOVER_TIMEOUT = 600
+DISCOVER_MAX_TOKENS = 1000
+
+STRATEGY_TEMPERATURE = 0.4
+STRATEGY_TIMEOUT = 600
+STRATEGY_MAX_TOKENS = 800
+
+ANALYSIS_ROUND_TEMPERATURE = 0.3
+ANALYSIS_ROUND_TIMEOUT = 600
+ANALYSIS_ROUND_MAX_TOKENS = 1500
+
+# ── Context budgets (generous — give agents enough to work with) ──
+INSIGHTS_BUDGET = 6000
+THESIS_BUDGET = 2000
+SOURCES_BUDGET = 8000
+SEARCH_HISTORY_BUDGET = 1500
+
+# ── Loop control ──────────────────────────────────────────────
+SATURATION_THRESHOLD = 3
+MAX_DISCOVERED_CRITERIA = 3
+
+# ── Plan confirmation ─────────────────────────────────────────
+PLAN_AUTO_CONFIRM_SECONDS = 120   # auto-start if user doesn't confirm/reject within this
+
 # ── Limits & sizes ─────────────────────────────────────────────
 TRACE_DETAIL_MAX_LENGTH = 2500
 MAX_CONTENT_PER_SOURCE_STORED = 30_000

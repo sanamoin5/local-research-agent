@@ -28,20 +28,187 @@ from .reporting import (
     generate_structured_report,
 )
 from .services import (
+    _criteria_fallback_queries,
+    _criteria_to_initial_queries,
+    _score_extraction,
+    analyze_round,
     async_playwright,
-    autonomous_step,
-    build_knowledge_summary,
+    challenge_beliefs,
     content_hash,
+    discover_new_angles,
     extract_content,
     fetch_browser,
     fetch_http,
+    fetch_jina_reader,
     normalize_url,
+    reflect_and_reason,
     should_retry_with_browser,
+    strategize_next_move,
     web_search,
 )
 
 TRACE_LOG_DIR = Path(os.getenv("LRA_TRACE_LOG_DIR", "trace_logs"))
 TRACE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class ResearchMemory:
+    """Structured lab notebook that grows across iterations."""
+
+    def __init__(self, criteria: list[str]) -> None:
+        self.active_criteria: list[str] = list(criteria)
+        self.insights: list[dict[str, Any]] = []
+        self.working_thesis: dict[str, str] = {}
+        self.confidence: dict[str, str] = {c: "LOW" for c in criteria}
+        self.surprises: list[str] = []
+        self.source_credibility: dict[str, str] = {}
+        self.discovered_topics: list[str] = []
+        self.cross_connections: list[str] = []
+        self.challenges: list[dict[str, str]] = []
+        self.search_history: list[str] = []
+        self.saturation_counter: int = 0
+
+    def build_working_thesis(self) -> str:
+        if not self.working_thesis:
+            return "No beliefs formed yet."
+        lines = []
+        for c in self.active_criteria:
+            belief = self.working_thesis.get(c, "No evidence yet.")
+            conf = self.confidence.get(c, "LOW")
+            lines.append(f"- {c}: {belief} ({conf})")
+        return "\n".join(lines)[:cfg.THESIS_BUDGET]
+
+    def build_insights_summary(self, max_chars: int = cfg.INSIGHTS_BUDGET) -> str:
+        if not self.insights:
+            return "No findings yet."
+        parts: list[str] = []
+        chars = 0
+        for insight in reversed(self.insights):
+            entry = insight.get("findings", "")
+            if not entry.strip():
+                continue
+            if chars + len(entry) > max_chars:
+                remaining = len(self.insights) - len(parts)
+                if remaining > 0:
+                    parts.append(f"... and {remaining} earlier rounds of findings")
+                break
+            parts.append(entry)
+            chars += len(entry)
+        return "\n\n".join(reversed(parts)) if parts else "No findings yet."
+
+    def build_credibility_summary(self) -> str:
+        counts: dict[str, int] = {"PRIMARY": 0, "SECONDARY": 0, "TERTIARY": 0}
+        for level in self.source_credibility.values():
+            upper = level.upper()
+            if upper in counts:
+                counts[upper] += 1
+        total = sum(counts.values())
+        if total == 0:
+            return "No sources rated yet."
+        return f"{counts['PRIMARY']} PRIMARY, {counts['SECONDARY']} SECONDARY, {counts['TERTIARY']} TERTIARY sources"
+
+    def build_criteria_with_confidence(self) -> str:
+        lines = []
+        for i, c in enumerate(self.active_criteria, 1):
+            conf = self.confidence.get(c, "LOW")
+            lines.append(f"  {i}. [{conf}] {c}")
+        return "\n".join(lines)
+
+    def build_surprises_text(self) -> str:
+        if not self.surprises:
+            return "None so far."
+        return "\n".join(f"- {s}" for s in self.surprises[-10:])
+
+    def is_saturated(self) -> bool:
+        return self.saturation_counter >= cfg.SATURATION_THRESHOLD
+
+    def has_strong_claims(self) -> bool:
+        return any(v in ("MEDIUM", "HIGH") for v in self.confidence.values())
+
+    def update_from_reflection(self, parsed: dict[str, Any]) -> None:
+        beliefs_text = parsed.get("beliefs", "")
+        if beliefs_text.strip():
+            belief_lines = [
+                l.strip().lstrip("-•* 0123456789.)")
+                for l in beliefs_text.splitlines()
+                if len(l.strip().lstrip("-•* 0123456789.)")) > 15
+            ]
+
+            for ci, criterion in enumerate(self.active_criteria):
+                crit_words = set(criterion.lower().split()[:4])
+                best_line = None
+                best_overlap = 0
+                for line in belief_lines:
+                    line_lower = line.lower()
+                    overlap = sum(1 for w in crit_words if w in line_lower and len(w) > 3)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_line = line
+                if best_line and best_overlap >= 1:
+                    self.working_thesis[criterion] = best_line[:300]
+                elif ci < len(belief_lines):
+                    self.working_thesis[criterion] = belief_lines[ci][:300]
+
+        conf_text = parsed.get("confidence", "")
+        if conf_text.strip():
+            conf_lines = [l.strip() for l in conf_text.splitlines() if l.strip()]
+            matched_any = False
+
+            for criterion in self.active_criteria:
+                crit_words = set(criterion.lower().split()[:4])
+                for line in conf_lines:
+                    line_lower = line.lower()
+                    overlap = sum(1 for w in crit_words if w in line_lower and len(w) > 3)
+                    if overlap >= 1:
+                        upper_line = line.upper()
+                        if "HIGH" in upper_line:
+                            self.confidence[criterion] = "HIGH"
+                            matched_any = True
+                        elif "MEDIUM" in upper_line:
+                            self.confidence[criterion] = "MEDIUM"
+                            matched_any = True
+                        elif "LOW" in upper_line:
+                            self.confidence[criterion] = "LOW"
+                            matched_any = True
+                        break
+
+            if not matched_any:
+                for i, criterion in enumerate(self.active_criteria):
+                    if i < len(conf_lines):
+                        upper = conf_lines[i].upper()
+                        if "HIGH" in upper:
+                            self.confidence[criterion] = "HIGH"
+                        elif "MEDIUM" in upper:
+                            self.confidence[criterion] = "MEDIUM"
+                        elif "LOW" in upper:
+                            self.confidence[criterion] = "LOW"
+
+    def update_from_analysis(self, parsed: dict[str, Any]) -> None:
+        self.insights.append({
+            "findings": parsed.get("findings", ""),
+            "contradictions": parsed.get("contradictions", ""),
+            "open_questions": parsed.get("open_questions", ""),
+        })
+
+        surprises_text = parsed.get("surprises", "")
+        if surprises_text.strip() and "NONE" not in surprises_text.upper()[:20]:
+            for line in surprises_text.splitlines():
+                cleaned = line.strip().lstrip("-•* ")
+                if len(cleaned) > 15:
+                    self.surprises.append(cleaned)
+
+        credibility_counts = parsed.get("credibility_counts", {})
+        for level, count in credibility_counts.items():
+            self.source_credibility[f"round_{len(self.insights)}_{level}"] = level
+
+    def add_discovered_criteria(self, new: list[str]) -> None:
+        cap = cfg.MAX_DISCOVERED_CRITERIA
+        for direction in new:
+            if len(self.discovered_topics) >= cap:
+                break
+            if direction not in self.active_criteria and direction not in self.discovered_topics:
+                self.discovered_topics.append(direction)
+                self.active_criteria.append(direction)
+                self.confidence[direction] = "LOW"
 
 
 @dataclass
@@ -153,10 +320,15 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
     usable_sources: list[dict[str, Any]] = []
     skipped_sources = 0
     all_urls_seen: set[str] = set()
-    search_history: list[str] = []
     step_idx = 1
-    last_observation = "This is the very first iteration. No research done yet — start by searching."
     max_iterations = settings.max_iterations
+
+    try:
+        plan_steps_text = "\n".join(f"  {i+1}. {s.description}" for i, s in enumerate(plan.steps))
+    except Exception:
+        plan_steps_text = "No plan steps available."
+
+    memory = ResearchMemory(criteria)
 
     log_path = TRACE_LOG_DIR / f"{task_id}.txt"
     log_file = open(log_path, "a", encoding="utf-8")
@@ -244,25 +416,43 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
                 if browser_result.ok and browser_extraction and browser_extraction["quality"] in {"medium", "good"}:
                     chosen_fetch, chosen_extraction, method = browser_result, browser_extraction, "browser_trafilatura"
 
+            # ── Tier 3: Jina Reader API fallback ──
             if not chosen_fetch.ok or not chosen_extraction or chosen_extraction["quality"] == "poor":
+                try:
+                    await _trace("fetch", f"[{ci}/{len(candidates)}] Trying Jina Reader: {candidate['url'][:60]}", "")
+                    jina_text, jina_title = await fetch_jina_reader(candidate["url"])
+                    if len(jina_text.strip()) > 200:
+                        jina_extraction = _score_extraction(jina_text, jina_title, task_text, candidate.get("query", ""))
+                        if jina_extraction["quality"] != "poor":
+                            chosen_extraction = jina_extraction
+                            method = "jina_reader"
+                            await _trace("extract", f"Jina Reader success: {jina_title[:60]}", f"Quality: {jina_extraction['quality']}")
+                except Exception:
+                    pass
+
+            if not chosen_extraction or chosen_extraction["quality"] == "poor":
                 skipped_sources += 1
                 repo.upsert_source(task_id, {
                     **candidate, "normalized_url": normalized,
-                    "fetch_status": chosen_fetch.fetch_status, "http_status": chosen_fetch.http_status,
-                    "content_type": chosen_fetch.content_type, "content_length_bytes": chosen_fetch.content_length_bytes,
+                    "fetch_status": chosen_fetch.fetch_status if chosen_fetch else "failed",
+                    "http_status": getattr(chosen_fetch, "http_status", None),
+                    "content_type": getattr(chosen_fetch, "content_type", None),
+                    "content_length_bytes": getattr(chosen_fetch, "content_length_bytes", None),
                     "extraction_status": "skipped", "quality": "poor", "extraction_method": method,
-                    "error_reason": chosen_fetch.error_reason or "low_quality",
+                    "error_reason": (chosen_fetch.error_reason if chosen_fetch else None) or "low_quality",
                 })
-                await _trace("skip", f"Skipped: {candidate['url'][:60]}", chosen_fetch.error_reason or "low_quality")
-                await bus.emit(task_id, "source_skipped", {"url": candidate["url"], "reason": chosen_fetch.error_reason or "low_quality"})
+                await _trace("skip", f"Skipped: {candidate['url'][:60]}", (chosen_fetch.error_reason if chosen_fetch else "") or "low_quality")
+                await bus.emit(task_id, "source_skipped", {"url": candidate["url"], "reason": (chosen_fetch.error_reason if chosen_fetch else "") or "low_quality"})
                 continue
 
             source = {
                 **candidate, "normalized_url": normalized,
                 "title": chosen_extraction["title"], "content_text": chosen_extraction["text"][:cfg.MAX_CONTENT_PER_SOURCE_STORED],
                 "quality": chosen_extraction["quality"], "fetch_status": "ok", "extraction_status": "ok",
-                "extraction_method": method, "content_type": chosen_fetch.content_type,
-                "content_length_bytes": chosen_fetch.content_length_bytes, "cache_hit": False,
+                "extraction_method": method,
+                "content_type": chosen_fetch.content_type if method != "jina_reader" else "text/markdown",
+                "content_length_bytes": chosen_fetch.content_length_bytes if method != "jina_reader" else len(chosen_extraction["text"]),
+                "cache_hit": False,
             }
             repo.upsert_source(task_id, source)
             usable_sources.append(source)
@@ -282,117 +472,196 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
 
         return new_usable
 
+    def _build_sources_content(sources: list[dict[str, Any]], max_chars: int = cfg.SOURCES_BUDGET) -> str:
+        parts: list[str] = []
+        chars = 0
+        for s in sources:
+            title = s.get("title", "Untitled")[:80]
+            url = s.get("url", "")[:100]
+            text = (s.get("content_text") or "")[:2000].strip()
+            entry = f"--- {title} ({url}) ---\n{text}\n"
+            if chars + len(entry) > max_chars:
+                break
+            parts.append(entry)
+            chars += len(entry)
+        return "\n".join(parts) if parts else "No documents available."
+
     # ════════════════════════════════════════════════════════════
-    #  AUTONOMOUS LOOP:  THINK → ACT → OBSERVE → repeat
-    #  One unified model call per iteration handles:
-    #  THOUGHTS → REASONING → PLAN → CRITICISM → ACTION
+    #  AUTONOMOUS LOOP — modular cognition
+    #
+    #  5 focused agents, each immersed in a single role:
+    #    REFLECT → CHALLENGE → DISCOVER → STRATEGIZE → ACT → ANALYZE
+    #
+    #  Iteration 1 is bootstrapped: criteria → queries → search → ANALYZE.
+    #  All LLM calls are SEQUENTIAL (one at a time through local Ollama).
     # ════════════════════════════════════════════════════════════
 
-    await _trace("info", f"Goal: {goal}", f"Success criteria:\n" + "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1)))
+    await _trace("info", f"Goal: {goal}", "Success criteria:\n" + "\n".join(f"  {i}. {c}" for i, c in enumerate(criteria, 1)))
     await bus.emit(task_id, "step_started", {"step": "autonomous_loop", "message": "Starting autonomous research loop"})
 
-    consecutive_empty = 0  # counts iterations that found zero new sources
+    def _query_stem(q: str) -> str:
+        return re.sub(r"\s+\d+$", "", q.lower().strip())
 
+    def _dedup_queries(queries: list[str]) -> list[str]:
+        history_stems = {_query_stem(q) for q in memory.search_history}
+        history_lower = {q.lower() for q in memory.search_history}
+        return [q for q in queries if q.lower() not in history_lower and _query_stem(q) not in history_stems]
+
+    iteration = 0
     for iteration in range(1, max_iterations + 1):
-        await _trace("info", f"══ Iteration {iteration}/{max_iterations} ══", f"Sources so far: {len(usable_sources)} | Skipped: {skipped_sources}")
+        phase = "EARLY" if iteration <= 3 else "MIDDLE" if iteration <= 8 else "LATE"
+        await _trace("info", f"══ Iteration {iteration}/{max_iterations} ({phase}) ══",
+                      f"Sources: {len(usable_sources)} | Skipped: {skipped_sources} | Criteria: {len(memory.active_criteria)}")
 
-        # ── UNIFIED THINK: analysis + action decision ──
-        knowledge = build_knowledge_summary(usable_sources)
-        await _trace("model_call", f"[THINK] Autonomous reasoning (iter {iteration})",
-                      f"Feeding observation from last round into the thinker...")
+        # ── ITERATION 1: BOOTSTRAP — nothing to reflect on yet ──
+        if iteration == 1:
+            await _trace("info", "[BOOTSTRAP] Generating initial queries from criteria")
+            queries = _criteria_to_initial_queries(criteria, task_text)
+            queries = _dedup_queries(queries)
+            if not queries:
+                queries = [task_text[:50]]
 
-        await _trace("info", f"[OBSERVATION → THINKER] What happened last round",
-                      last_observation[:800])
+            await _trace("info", f"[ACT] Executing {len(queries)} initial searches",
+                          "\n".join(f"  {i}. {q}" for i, q in enumerate(queries, 1)))
+            new_count = await _search_and_fetch(queries, iteration)
+            memory.search_history.extend(queries)
 
-        step = await autonomous_step(
-            goal, criteria, knowledge, search_history, last_observation,
-            iteration, config.ollama_base_url, settings.model_name,
-            temperature=settings.reasoning_temperature,
-        )
+            if new_count > 0:
+                sources_content = _build_sources_content(usable_sources[-new_count:])
+                await _trace("model_call", f"[ANALYST] Analyzing {new_count} initial sources")
+                analysis = await analyze_round(
+                    task_text, goal, memory.active_criteria,
+                    memory.build_working_thesis(),
+                    memory.build_insights_summary(),
+                    sources_content,
+                    config.ollama_base_url, settings.model_name,
+                )
+                memory.update_from_analysis(analysis)
+                await _trace("model_result", "[ANALYST] Initial analysis complete",
+                              analysis.get("findings", "")[:600])
+                memory.saturation_counter = 0
+            else:
+                memory.saturation_counter += 1
 
-        await _trace("model_result", f"[THOUGHTS] Agent's analysis (iter {iteration})",
-                      step["thoughts"][:600])
-        await _trace("model_result", f"[REASONING] Why this next action",
-                      step["reasoning"][:400])
-        await _trace("model_result", f"[CRITICISM] Self-critique",
-                      step["criticism"][:400])
-        await _trace("model_result", f"[PLAN] Next steps",
-                      step["plan"][:400])
-        await _trace("model_result", f"[DECISION] Action: {step['action']}",
-                      "Queries:\n" + "\n".join(f"  {i}. {q}" for i, q in enumerate(step["queries"], 1))
-                      if step["queries"] else "Ready to synthesize")
-
-        good_sources = [s for s in usable_sources if s.get("quality") == "good"]
-        min_to_complete = cfg.MIN_SOURCES_TO_COMPLETE if not good_sources else cfg.MIN_SOURCES_TO_COMPLETE_WITH_GOOD
-
-        # COMPLETE if: agent decided so with enough sources, OR stuck with enough sources
-        if step["action"] == "COMPLETE" and len(usable_sources) >= min_to_complete:
-            await _trace("info", f"Agent decided COMPLETE at iteration {iteration} ({len(usable_sources)} sources, {len(good_sources)} good) — proceeding to synthesis")
-            break
-
-        if consecutive_empty >= cfg.MAX_CONSECUTIVE_EMPTY_ROUNDS and len(usable_sources) >= min_to_complete:
-            await _trace("info", f"[STUCK] No new sources for {consecutive_empty} consecutive rounds with {len(usable_sources)} sources — moving to synthesis")
-            break
-
-        # ── ACT: search + fetch ──
-        queries = step["queries"]
-
-        # Guard: strip near-duplicates (e.g. "topic guide 3" when "topic guide 2" already searched)
-        def _query_stem(q: str) -> str:
-            return re.sub(r"\s+\d+$", "", q.lower().strip())
-
-        history_stems = {_query_stem(q) for q in search_history}
-        history_lower = {q.lower() for q in search_history}
-        novel = [q for q in queries if q.lower() not in history_lower and _query_stem(q) not in history_stems]
-
-        if not novel and queries:
-            await _trace("warning", f"[GUARD] All {len(queries)} queries are duplicates or near-duplicates — generating fresh criteria-based angles")
-            from .services import _criteria_fallback_queries
-            queries = _criteria_fallback_queries(criteria, search_history, iteration, task_text)
-            queries = [q for q in queries if q.lower() not in history_lower and _query_stem(q) not in history_stems]
-
-        if not queries:
-            await _trace("warning", f"[GUARD] Could not generate any novel queries at iter {iteration} — skipping search")
-            consecutive_empty += 1
             await asyncio.sleep(settings.inter_iteration_cooldown)
             continue
 
+        # ── 1. REFLECT: Where do we stand? ──
+        await _trace("model_call", f"[REFLECT] Senior scientist reviewing progress (iter {iteration})")
+        reflection = await reflect_and_reason(
+            task_text, goal, plan_steps_text,
+            memory.build_criteria_with_confidence(),
+            memory.build_working_thesis(),
+            memory.build_insights_summary(),
+            memory.build_credibility_summary(),
+            "\n".join(f"  - {q}" for q in memory.search_history[-30:]) if memory.search_history else "(none yet)",
+            config.ollama_base_url, settings.model_name,
+        )
+        memory.update_from_reflection(reflection)
+        await _trace("model_result", f"[REFLECT] Beliefs updated | Verdict: {reflection['decision']}",
+                      f"Thesis:\n{memory.build_working_thesis()[:400]}\n\nCritique:\n{reflection.get('critique', '')[:300]}")
+
+        # ── 2. DECIDE: Should we stop? ──
+        good_sources = [s for s in usable_sources if s.get("quality") == "good"]
+        min_to_complete = cfg.MIN_SOURCES_TO_COMPLETE if not good_sources else cfg.MIN_SOURCES_TO_COMPLETE_WITH_GOOD
+
+        if reflection["decision"] == "STOP" and len(usable_sources) >= min_to_complete:
+            await _trace("info", f"[CONVERGED] REFLECT says STOP at iteration {iteration} ({len(usable_sources)} sources)")
+            break
+
+        if memory.is_saturated() and len(usable_sources) >= min_to_complete:
+            await _trace("info", f"[SATURATED] No new insights for {memory.saturation_counter} rounds — moving to synthesis")
+            break
+
+        # ── 3. CHALLENGE: Try to disprove our strongest claims ──
+        challenge_queries: list[dict[str, str]] = []
+        await _trace("model_call", "[CHALLENGE] Skeptical reviewer examining claims")
+        challenge = await challenge_beliefs(
+            task_text,
+            memory.build_working_thesis(),
+            config.ollama_base_url, settings.model_name,
+        )
+        challenge_queries = challenge.get("queries", [])
+        for q in challenge_queries:
+            memory.challenges.append({
+                "claim": q.get("challenges", ""),
+                "query": q.get("query", ""),
+                "status": "pending",
+            })
+        await _trace("model_result", f"[CHALLENGE] {len(challenge_queries)} disconfirming queries generated",
+                      challenge.get("weaknesses", "")[:400])
+
+        # ── 4. DISCOVER: Find patterns and missing angles ──
+        await _trace("model_call", "[DISCOVER] Pattern spotter looking for hidden connections")
+        discovery = await discover_new_angles(
+            task_text, memory.active_criteria,
+            memory.build_insights_summary(),
+            memory.build_surprises_text(),
+            config.ollama_base_url, settings.model_name,
+        )
+        old_criteria_count = len(memory.active_criteria)
+        memory.add_discovered_criteria(discovery.get("new_directions", []))
+        memory.cross_connections.extend(discovery.get("patterns", []))
+        new_criteria_added = len(memory.active_criteria) - old_criteria_count
+        await _trace("model_result",
+                      f"[DISCOVER] {len(discovery.get('patterns', []))} patterns | {new_criteria_added} new directions",
+                      discovery.get("missing", "")[:400])
+
+        # ── 5. STRATEGIZE: What to search next? ──
+        challenge_items_text = "\n".join(
+            f"- {q['query']} (tests: {q.get('challenges', '?')})" for q in challenge_queries
+        ) if challenge_queries else ""
+        new_angles_text = "\n".join(f"- {d}" for d in discovery.get("new_directions", [])) or ""
+
+        await _trace("model_call", f"[STRATEGIZE] Planning search queries ({phase} phase)")
+        strategy = await strategize_next_move(
+            goal, task_text,
+            reflection.get("gaps", ""),
+            challenge_items_text,
+            new_angles_text + ("\n" + discovery.get("missing", "") if discovery.get("missing") else ""),
+            memory.search_history, phase,
+            config.ollama_base_url, settings.model_name,
+        )
+        queries = strategy.get("queries", [])
+        queries = _dedup_queries(queries)
+
+        if not queries:
+            await _trace("warning", "[GUARD] STRATEGIZE produced no novel queries — falling back to criteria")
+            queries = _criteria_fallback_queries(memory.active_criteria, memory.search_history, iteration, task_text)
+            queries = _dedup_queries(queries)
+
+        if not queries:
+            await _trace("warning", f"[GUARD] No novel queries possible at iter {iteration} — skipping search")
+            memory.saturation_counter += 1
+            await asyncio.sleep(settings.inter_iteration_cooldown)
+            continue
+
+        await _trace("model_result", f"[STRATEGIZE] {len(queries)} queries planned",
+                      "\n".join(f"  {i}. {q}" for i, q in enumerate(queries, 1)))
+
+        # ── 6. ACT: Search + fetch ──
         await _trace("info", f"[ACT] Executing {len(queries)} searches")
         new_count = await _search_and_fetch(queries, iteration)
-        search_history.extend(queries)
+        memory.search_history.extend(queries)
 
-        # ── OBSERVE: build observation of what was found for next iteration ──
-        good_count = sum(1 for s in usable_sources if s.get("quality") == "good")
-        med_count = sum(1 for s in usable_sources if s.get("quality") == "medium")
-        quality_summary = f"Quality breakdown: {good_count} good, {med_count} medium"
-
+        # ── 7. ANALYZE: What did we just learn? ──
         if new_count > 0:
-            consecutive_empty = 0
-            new_snippets = [
-                f"- ({s.get('quality', '?')}) {s.get('title', '?')[:50]}: {(s.get('content_text') or '')[:cfg.OBSERVATION_SNIPPET_LENGTH].strip()}"
-                for s in usable_sources[-new_count:]
-            ]
-            last_observation = (
-                f"Found {new_count} new usable sources this round (total: {len(usable_sources)}). {quality_summary}.\n"
-                f"New sources:\n" + "\n".join(new_snippets[:6])
+            sources_content = _build_sources_content(usable_sources[-new_count:])
+            await _trace("model_call", f"[ANALYST] Analyzing {new_count} new sources (iter {iteration})")
+            analysis = await analyze_round(
+                task_text, goal, memory.active_criteria,
+                memory.build_working_thesis(),
+                memory.build_insights_summary(),
+                sources_content,
+                config.ollama_base_url, settings.model_name,
             )
-        elif len(usable_sources) > 0:
-            consecutive_empty += 1
-            last_observation = (
-                f"No NEW sources found this round (searches returned duplicates or low-quality pages). "
-                f"Total usable: {len(usable_sources)}, skipped: {skipped_sources}. {quality_summary}. "
-                f"Try COMPLETELY DIFFERENT angles — focus on criteria not yet covered."
-            )
+            memory.update_from_analysis(analysis)
+            await _trace("model_result", f"[ANALYST] Round {iteration} analysis complete",
+                          analysis.get("findings", "")[:600])
+            memory.saturation_counter = 0
         else:
-            consecutive_empty += 1
-            last_observation = (
-                f"Still no usable sources after {iteration} iterations. "
-                f"All {skipped_sources} pages were low quality or failed to fetch. "
-                f"Try much broader or different search queries."
-            )
-
-        await _trace("info", f"[OBSERVE] Round {iteration} results",
-                      last_observation[:600])
+            memory.saturation_counter += 1
+            await _trace("info", f"[OBSERVE] No new sources found (saturation: {memory.saturation_counter}/{cfg.SATURATION_THRESHOLD})")
 
         await asyncio.sleep(settings.inter_iteration_cooldown)
 
@@ -425,13 +694,13 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
     await _trace("model_call", "[COORDINATOR] Deciding synthesis strategy",
                   f"Examining {len(top_sources)} sources to determine: DIRECT (1 call) or MULTI_AGENT (themed analysts + synthesizer)")
 
-    plan = await coordinate_synthesis(
+    synth_plan = await coordinate_synthesis(
         task_text, top_sources, config.ollama_base_url, settings.model_name,
     )
-    strategy = plan["strategy"]
-    groups = plan.get("groups", [])
+    strategy = synth_plan["strategy"]
+    groups = synth_plan.get("groups", [])
 
-    strategy_detail = f"Strategy: {strategy}\nReason: {plan['reason']}"
+    strategy_detail = f"Strategy: {strategy}\nReason: {synth_plan['reason']}"
     if groups:
         strategy_detail += "\nThematic groups:\n" + "\n".join(
             f"  Group {i+1} [{g['theme']}]: sources {g['indices']}" for i, g in enumerate(groups)
@@ -443,16 +712,18 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
 
     detailed_findings_md = ""
 
+    synthesis_criteria = memory.active_criteria if memory.active_criteria else criteria
+
     if strategy == "DIRECT":
         # ── DIRECT: multi-section report from sources ──
-        n_criteria_d = len(criteria) if criteria else 0
+        n_criteria_d = len(synthesis_criteria)
         await _trace("model_call", f"[WRITER] Direct multi-section report ({n_criteria_d} sections)",
                       f"Writing report from {len(top_sources)} sources (focused topic)")
         raw_report = await _direct_synthesis(
             task_text, top_sources, config.ollama_base_url, settings.model_name,
             temperature=settings.synthesis_temperature,
             max_tokens=settings.synthesis_max_tokens,
-            criteria=criteria,
+            criteria=synthesis_criteria,
         )
         clean_markdown = _clean_report_markdown(raw_report)
         detailed_findings_md = clean_markdown
@@ -487,7 +758,7 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
                     config.ollama_base_url, settings.model_name,
                     temperature=settings.synthesis_temperature,
                     max_tokens=min(settings.synthesis_max_tokens, 2048),
-                    criteria=criteria,
+                    criteria=synthesis_criteria,
                 )
                 if isinstance(extract, str) and len(extract.strip()) > 20:
                     per_source_extracts.append(extract.strip())
@@ -520,7 +791,7 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
             task_text, per_source_extracts, config.ollama_base_url, settings.model_name,
             temperature=settings.synthesis_temperature,
             max_tokens=min(settings.synthesis_max_tokens, 4096),
-            criteria=criteria,
+            criteria=synthesis_criteria,
         )
         if analysis.strip():
             await _trace("model_result", "[ANALYST] Expert analysis complete", analysis[:600])
@@ -528,7 +799,7 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
             await _trace("warning", "[ANALYST] Analysis returned empty — synthesizer will work from extracts only")
 
         # ── SYNTHESIS: per-section writers + bookends → long comprehensive report ──
-        n_criteria = len(criteria) if criteria else 0
+        n_criteria = len(synthesis_criteria) if synthesis_criteria else 0
         await _trace("model_call",
                       f"[SYNTHESIZER] Writing {n_criteria} sections + bookends from {len(per_source_extracts)} extracts + expert analysis",
                       "Each section gets its own dedicated writer agent for maximum depth")
@@ -540,7 +811,7 @@ async def _run_pipeline_inner(task_id: str, config: RunConfig, repo: Repository,
             task_text, per_source_extracts, config.ollama_base_url, settings.model_name,
             temperature=settings.synthesis_temperature,
             max_tokens=settings.synthesis_max_tokens,
-            criteria=criteria,
+            criteria=synthesis_criteria,
             analysis=analysis,
             progress_callback=_synth_progress,
         )

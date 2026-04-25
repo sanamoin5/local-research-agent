@@ -39,6 +39,7 @@ Most "AI research" tools wrap a single LLM call. This one runs an **autonomous a
 - [Architecture](#architecture)
 - [Project structure](#project-structure)
 - [Quick start](#quick-start)
+- [GPU / MPS acceleration](#gpu--mps-acceleration)
 - [Configuration](#configuration)
 - [Settings panel (UI)](#settings-panel-ui)
 - [Adding a screenshot](#adding-a-screenshot)
@@ -57,26 +58,42 @@ Most "AI research" tools wrap a single LLM call. This one runs an **autonomous a
 Submit task
     │
     ▼
-Goal formulation ,  defines a clear goal + measurable success criteria
+Goal formulation  —  converts the task into a clear goal + research criteria
     │
     ▼
-Autonomous loop  (repeats until criteria are met or time limit reached)
-  ┌─────────────────────────────────────────────────────────────┐
-  │  THINK   ,  reason: what do I know? what's missing?          │
-  │  ACT     ,  run web searches, fetch + extract pages          │
-  │  OBSERVE ,  summarise what was found, feed into next iter    │
-  └─────────────────────────────────────────────────────────────┘
+Multi-agent planning  —  4 agents build a detailed research plan
+  (Intent Clarifier → Topic Decomposer → Question Expander → Plan Critic)
     │
     ▼
-Coordinator agent ,  chooses synthesis strategy:
-  • DIRECT      → single LLM synthesis call (focused topics)
-  • MULTI_AGENT → themed analyst agents + final synthesizer (complex topics)
+Autonomous research loop  (repeats until criteria are met or time limit)
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Iteration 1 — BOOTSTRAP                                            │
+  │    criteria → initial queries → search + fetch → ANALYST            │
+  │                                                                     │
+  │  Iterations 2+ — Full 5-agent cycle                                 │
+  │    REFLECT    — Senior Scientist: updates working thesis, decides   │
+  │                 continue/stop, provides honest self-critique         │
+  │    CHALLENGE  — Skeptical Reviewer: finds weaknesses, generates     │
+  │                 disconfirming search queries                         │
+  │    DISCOVER   — Pattern Spotter: cross-connects findings, surfaces  │
+  │                 hidden angles, suggests new research directions      │
+  │    STRATEGIZE — Search Strategist: plans phase-adaptive queries     │
+  │                 targeting gaps, challenges, and new leads            │
+  │    ACT        — web search + page fetch + extraction                │
+  │    ANALYZE    — Forensic Analyst: reads new documents, rates source │
+  │                 credibility (PRIMARY / SECONDARY / TERTIARY)        │
+  └─────────────────────────────────────────────────────────────────────┘
     │
     ▼
-Clean markdown report ,  rendered in UI, copy/download available
+Coordinator agent  —  chooses synthesis strategy:
+  • DIRECT      → per-section writers (focused topics)
+  • MULTI_AGENT → per-source fact extractors + analyst + section writers
+    │
+    ▼
+Clean markdown report  —  rendered in UI, copy/download available
 ```
 
-Each thinking step writes explicit **THOUGHTS → REASONING → PLAN → CRITICISM → ACTION**, all visible in the live trace panel and persisted to the database.
+Each agent is a **modular cognitive unit** — it knows only its role, not the pipeline. The orchestrator wires them together via a structured `ResearchMemory` (working thesis, confidence scores, source credibility, cross-connections, challenges) that evolves across iterations.
 
 ---
 
@@ -84,18 +101,21 @@ Each thinking step writes explicit **THOUGHTS → REASONING → PLAN → CRITICI
 
 | | Feature |
 |---|---|
-| ♻️ | **Iterative autonomous loop** ,  searches, reads, and reflects until the goal is met |
-| 🧠 | **Chain-of-thought reasoning** ,  full THOUGHTS / REASONING / PLAN / CRITICISM at every step |
-| 🎯 | **Goal formulation** ,  converts any task into measurable success criteria before starting |
-| 🤝 | **Adaptive synthesis** ,  coordinator agent picks single-shot or multi-agent strategy based on complexity |
-| 📡 | **Live trace streaming** ,  every action streamed to the UI via SSE; replay from DB for past tasks |
-| 🔁 | **Duplicate query guard** ,  detects looping and forces fresh search angles |
-| 🚫 | **Junk domain filtering** ,  search engines (Google, Bing, Yandex…) are auto-skipped |
-| 🌐 | **Browser fallback** ,  Playwright/Chromium re-fetches pages where HTTP extraction is weak |
-| ⭐ | **Source quality scoring** ,  pages ranked good / medium / poor; synthesis uses only the best |
-| ⚙️ | **UI settings panel** ,  all tunable values editable from the browser, persisted to SQLite |
-| 🆓 | **Free web search** ,  DuckDuckGo with exponential backoff; zero API costs |
-| 🗄️ | **Full SQLite persistence** ,  tasks, sources, steps, traces, cache, and settings |
+| 🔬 | **5-agent autonomous loop** — REFLECT, CHALLENGE, DISCOVER, STRATEGIZE, ANALYZE each do one cognitive task deeply |
+| 🧠 | **Working thesis** — evolving belief per research criterion, updated and stress-tested every iteration |
+| ⚔️ | **Active disconfirmation** — dedicated CHALLENGE agent seeks evidence that disproves current beliefs |
+| ⭐ | **Source credibility ratings** — PRIMARY / SECONDARY / TERTIARY labels applied inline by the Forensic Analyst |
+| 🔗 | **Cross-connection discovery** — DISCOVER agent finds patterns across research areas that humans miss |
+| 🎯 | **Goal formulation** — converts any task into specific, searchable research angles before starting |
+| 🗂️ | **Multi-agent planning** — 4 planning agents build a detailed research plan before the loop starts |
+| 🤝 | **Adaptive synthesis** — coordinator picks single-shot or multi-agent strategy based on complexity |
+| 📡 | **Live trace streaming** — every agent call, query, fetch, and decision streamed via SSE; replayed from DB |
+| 🔁 | **Duplicate query guard** — stem-normalized dedup prevents looping; criteria fallback when stuck |
+| 🚫 | **Junk domain filtering** — search engines (Google, Bing, Yandex…) auto-skipped |
+| 🌐 | **Browser fallback** — Playwright/Chromium re-fetches pages where HTTP extraction is weak |
+| 🆓 | **Free web search** — DuckDuckGo with exponential backoff; zero API costs |
+| 🗄️ | **Full SQLite persistence** — tasks, sources, steps, traces, cache, and settings |
+| ⚙️ | **UI settings panel** — all tunable values editable from the browser, persisted to SQLite |
 
 ---
 
@@ -103,14 +123,15 @@ Each thinking step writes explicit **THOUGHTS → REASONING → PLAN → CRITICI
 
 | Layer | Technology |
 |-------|-----------|
-| LLM runtime | [Ollama](https://ollama.ai) ,  local model server |
+| LLM runtime | [Ollama](https://ollama.ai) — local model server |
 | Recommended model | `llama3.1:8b` (or any Ollama-compatible model) |
 | Web framework | [FastAPI](https://fastapi.tiangolo.com) + [Uvicorn](https://www.uvicorn.org) |
 | Data validation | [Pydantic v2](https://docs.pydantic.dev) |
 | Web search | [DuckDuckGo Search](https://github.com/deedy5/duckduckgo_search) (free, no key) |
 | HTTP client | [HTTPX](https://www.python-httpx.org) (async) |
 | Browser automation | [Playwright](https://playwright.dev/python/) (Chromium, headless) |
-| Content extraction | [Trafilatura](https://trafilatura.readthedocs.io) |
+| Content extraction | [Trafilatura](https://trafilatura.readthedocs.io) + [Jina Reader](https://jina.ai/reader/) (fallback) |
+| Vector similarity | [ChromaDB](https://www.trychroma.com) (optional, for semantic fact retrieval) |
 | Database | SQLite (via Python stdlib `sqlite3`) |
 | Frontend | Vanilla JS + SSE + [marked.js](https://marked.js.org) for markdown rendering |
 | Containerisation | Docker + Docker Compose |
@@ -125,13 +146,22 @@ Browser  (static/index.html)
     ▼
 FastAPI  (app/main.py)
     │
-    ├── Repository (app/repository.py)     SQLite ,  tasks, sources, steps, traces, cache, settings
+    ├── Repository (app/repository.py)     SQLite — tasks, sources, steps, traces, cache, settings
     │
-    ├── Pipeline (app/pipeline.py)         Autonomous loop + synthesis orchestration
-    │     ├── Services (app/services.py)   Ollama LLM · DuckDuckGo · HTTP/browser fetch · extraction
-    │     └── Reporting (app/reporting.py) Coordinator · Analyst agents · Synthesizer · Markdown clean
+    ├── Pipeline (app/pipeline.py)         ResearchMemory · autonomous loop · synthesis orchestration
+    │     │  ResearchMemory tracks: working thesis, confidence, source credibility,
+    │     │  cross-connections, challenges, surprises, search history, saturation
+    │     │
+    │     ├── Services (app/services.py)   5 reasoning agents · Ollama LLM · DuckDuckGo
+    │     │     ├── analyze_round()        Forensic Analyst — reads docs, rates credibility
+    │     │     ├── reflect_and_reason()   Senior Scientist — updates thesis, decides stop/continue
+    │     │     ├── challenge_beliefs()    Skeptical Reviewer — disconfirming queries
+    │     │     ├── discover_new_angles()  Pattern Spotter — cross-connections, new directions
+    │     │     └── strategize_next_move() Search Strategist — phase-adaptive queries
+    │     │
+    │     └── Reporting (app/reporting.py) Coordinator · fact extractors · section writers · markdown
     │
-    └── Config (app/config.py)             All constants in one place
+    └── Config (app/config.py)             All constants — per-agent timeouts, temps, context budgets
 ```
 
 ### Two-tier configuration
@@ -228,7 +258,81 @@ Open: `http://localhost:8000`
 
 ---
 
-## Configuration
+## GPU / MPS acceleration
+
+> **TL;DR** — Ollama handles GPU inference automatically when running natively. In Docker on Mac, GPU passthrough to the container is not supported, so use the Mac override to connect to your host Ollama instead.
+
+### Apple Silicon (M1 / M2 / M3 / M4)
+
+Ollama uses **Metal / MPS** automatically when run natively. The trick is that the bundled Docker Ollama container runs inside a Linux VM and **cannot reach the host GPU**.
+
+**Recommended setup (fastest inference):**
+```bash
+# 1. Run Ollama natively (uses MPS automatically)
+ollama serve                    # or just open Ollama.app
+
+# 2. Pull your model
+ollama pull llama3.1:8b
+
+# 3. Start only the app container, pointing it to host Ollama
+docker compose -f docker-compose.yml -f docker-compose.mac.yml up --build -d
+```
+
+The `docker-compose.mac.yml` override removes the Docker Ollama service and sets `OLLAMA_BASE_URL=http://host.docker.internal:11434`.
+
+**Verify MPS is active:**
+```bash
+# While a model is running, check GPU usage in Activity Monitor
+# → Window → GPU History, or:
+sudo powermetrics --samplers gpu_power -i 1000 -n 3
+```
+
+**Best models for Apple Silicon:**
+
+| VRAM | Recommended model | Quantisation |
+|------|-------------------|-------------|
+| 8 GB  | `llama3.1:8b` | Q4_K_M (default) |
+| 16 GB | `llama3.1:8b` or `mistral:7b` | Q8_0 |
+| 32 GB | `llama3.1:8b` + longer context | Q8_0 |
+| 64 GB | `llama3.3:70b` | Q4_K_M |
+
+Pull a specific quantisation: `ollama pull llama3.1:8b-instruct-q8_0`
+
+---
+
+### NVIDIA GPU (Linux / WSL2)
+
+The `docker-compose.nvidia.yml` override passes all NVIDIA GPUs into the Ollama container.
+
+**Requirements:** [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed on the host.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up --build -d
+```
+
+**Verify GPU is being used:**
+```bash
+docker exec lra-ollama nvidia-smi
+docker exec lra-ollama ollama ps     # shows model + VRAM used
+```
+
+**To use a specific GPU** (multi-GPU host), set `CUDA_VISIBLE_DEVICES` in the override file or via env:
+```bash
+CUDA_VISIBLE_DEVICES=0 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+```
+
+---
+
+### Option B: run locally (always GPU-native)
+
+Running with `uvicorn` directly (not Docker) means Ollama, sentence-transformers, and ChromaDB all run on bare metal and pick up MPS or CUDA automatically — no overrides needed.
+
+```bash
+ollama serve &
+uvicorn app.main:app --reload
+```
+
+---
 
 ### Environment variables
 
@@ -239,30 +343,42 @@ Open: `http://localhost:8000`
 | `LRA_DB_PATH` | `local_research_agent.db` | SQLite database path |
 | `LRA_TRACE_LOG_DIR` | `trace_logs/` | Directory for per-task `.txt` trace logs |
 
-### `app/config.py` ,  all developer constants
+### `app/config.py` — all developer constants
 
 Edit this file to tune anything not exposed in the UI:
 
 ```python
 # LLM
-REASONING_TEMPERATURE = 0.4     # thinker creativity
-SYNTHESIS_TEMPERATURE = 0.4     # report writing style
-SYNTHESIS_MAX_TOKENS  = 8192    # report output length
-OLLAMA_DEFAULT_TIMEOUT = 120    # seconds per LLM call
+OLLAMA_DEFAULT_TIMEOUT   = 600    # seconds per LLM call (generous for local models)
+SYNTHESIS_TEMPERATURE    = 0.4    # report writing style
+SYNTHESIS_MAX_TOKENS     = 8192   # report output length
+
+# Per-agent settings (all 5 agents fully configurable)
+REFLECT_TEMPERATURE      = 0.4    # Senior Scientist creativity
+REFLECT_MAX_TOKENS       = 2000
+CHALLENGE_TEMPERATURE    = 0.5    # Skeptical Reviewer creativity
+DISCOVER_TEMPERATURE     = 0.6    # Pattern Spotter — slightly more exploratory
+STRATEGY_TEMPERATURE     = 0.4    # Search Strategist
+ANALYSIS_ROUND_MAX_TOKENS = 1500  # Forensic Analyst output budget
+
+# Context budgets (chars passed to agent prompts)
+INSIGHTS_BUDGET          = 6000   # accumulated findings
+SOURCES_BUDGET           = 8000   # raw docs for ANALYZE
+THESIS_BUDGET            = 2000   # working thesis summary
 
 # Search
-INTER_QUERY_DELAY       = 4.0   # seconds between DDG queries
-INTER_ITERATION_COOLDOWN = 5.0  # seconds between loop iterations
-SEARCH_RETRY_COUNT      = 5     # DDG retries on rate limit
-MAX_QUERY_WORD_COUNT    = 8     # reject sentence-like queries
+INTER_QUERY_DELAY        = 4.0    # seconds between DDG queries
+INTER_ITERATION_COOLDOWN = 5.0    # seconds between loop iterations
+SEARCH_RETRY_COUNT       = 5      # DDG retries on rate limit
+MAX_QUERY_WORD_COUNT     = 8      # reject sentence-like queries
+
+# Loop control
+SATURATION_THRESHOLD     = 3      # empty rounds before giving up
+MAX_DISCOVERED_CRITERIA  = 3      # cap on new research directions
 
 # Synthesis
-TOP_SOURCES_CAP         = 9     # sources passed to synthesis
-ANALYST_BATCH_SIZE      = 3     # sources per analyst agent
-SOURCE_CONTENT_LENGTH   = 3000  # chars fed per source
-
-# Quality
-MIN_SOURCES_TO_COMPLETE = 3     # usable sources needed to finish loop
+TOP_SOURCES_CAP          = 9      # sources passed to synthesis
+SOURCE_CONTENT_LENGTH    = 6000   # chars fed per source
 ```
 
 ---
@@ -353,12 +469,13 @@ planning  →  (user confirms)  →  running  →  completed
                                            ↘  cancelled
 ```
 
-1. Task submitted → goal formulated → research plan created
+1. Task submitted → goal formulated → multi-agent research plan created
 2. User reviews plan in the **Plan Review** card → confirms or rejects
-3. Autonomous loop starts: THINK → ACT → OBSERVE (repeated)
-4. When criteria are met (or max iterations hit): coordinator decides synthesis strategy
-5. Analyst agents extract insights; synthesizer writes the final report
-6. Report stored in DB; UI reloads output tabs
+3. Iteration 1 bootstrap: criteria → initial queries → search → ANALYZE
+4. Iterations 2+: REFLECT → CHALLENGE → DISCOVER → STRATEGIZE → ACT → ANALYZE
+5. Loop exits when REFLECT says STOP (thesis converged) or saturation threshold hit
+6. Coordinator decides synthesis strategy; section-writer agents produce the report
+7. Report stored in DB; UI reloads output tabs
 
 On container restart, tasks stuck in `planning` or `running` are automatically marked `interrupted`.
 
@@ -368,22 +485,25 @@ On container restart, tasks stuck in `planning` or `running` are automatically m
 
 The UI shows two output tabs:
 
-**Consolidated Report** ,  clean markdown report written by the synthesizer. No source links, no numeric citations. Rendered with headings, bullet points, tables, and code blocks.
+**Consolidated Report** — clean markdown report written by the synthesizer. No source links, no numeric citations. Rendered with headings, bullet points, tables, and code blocks.
 
-**Detailed Findings** ,  raw analyst agent outputs, grouped by theme. Useful for tracing where specific claims came from.
+**Detailed Findings** — raw analyst agent outputs, grouped by theme. Useful for tracing where specific claims came from.
 
 Both tabs have **Copy** and **Download** buttons. The trace panel shows every step:
 
 ```
-[THOUGHTS]   → agent's analysis of current knowledge gaps    (click to expand)
-[REASONING]  → why it's taking the next action               (click to expand)
-[CRITICISM]  → self-critique and risk assessment             (click to expand)
-[PLAN]       → immediate next steps                          (click to expand)
-[DECISION]   → action chosen + queries generated             (click to expand)
-search       → DDG query results
-extract      → page fetch quality and method
-[ANALYST]    → per-batch source analysis
-[SYNTHESIZER]→ final report writing
+[BOOTSTRAP]   → iteration 1: initial queries from criteria
+[REFLECT]     → senior scientist: updated thesis, confidence, critique, verdict
+[CHALLENGE]   → skeptical reviewer: weaknesses found, disconfirming queries
+[DISCOVER]    → pattern spotter: cross-connections, missing angles, new directions
+[STRATEGIZE]  → search strategist: queries planned for this phase
+[ACT]         → searches executed
+search        → DuckDuckGo results
+extract       → page fetch quality and method (http / browser / jina)
+[ANALYST]     → forensic analyst: findings with credibility ratings, surprises
+[COORDINATOR] → synthesis strategy decision
+[EXTRACTOR]   → per-source fact extraction
+[SYNTHESIZER] → per-section writers + bookend writing
 ```
 
 ---
@@ -407,7 +527,7 @@ Old DB rows may have a low `max_total_runtime_sec` saved from a previous version
 DuckDuckGo rate-limits aggressive use. Increase **Query Delay** in the Settings panel (try 8–10 s). Also expand the `[DECISION]` trace entries to see exactly what queries were generated.
 
 ### Agent repeating the same query
-Lower **Reasoning Temp** in Settings (e.g. 0.2) for more deterministic query generation. The duplicate guard should prevent loops, but a lower temperature helps the model stay on track.
+Lower `STRATEGY_TEMPERATURE` in `app/config.py` (try `0.2`) for more deterministic query generation. The stem-normalized duplicate guard prevents exact loops, and the `_criteria_fallback_queries` function kicks in automatically when STRATEGIZE produces no novel results.
 
 ### Browser fallback unavailable
 ```bash
@@ -447,14 +567,17 @@ PYTHONPATH=. pytest -q
 ---
 
 <p align="center">
-  <sub>Built with Ollama · FastAPI · DuckDuckGo · Playwright · SQLite · Trafilatura</sub>
+  <sub>Built with Ollama · FastAPI · DuckDuckGo · Playwright · Trafilatura · Jina Reader · SQLite · ChromaDB</sub>
 </p>
 
 <!-- 
   Keywords for discoverability:
-  local AI agent, autonomous research agent, self-hosted research tool, 
+  local AI agent, autonomous research agent, self-hosted research tool,
   ollama agent, llm research automation, auto-gpt local, chasgpt research,
   local llm research, no-api-key research agent, duckduckgo ai search,
   fastapi ollama, llama research agent, open source research automation,
-  ai web scraper, iterative research agent, chain of thought research
+  ai web scraper, iterative research agent, chain of thought research,
+  multi-agent research, working thesis agent, disconfirming evidence AI,
+  source credibility AI, scientific research agent, modular cognition LLM,
+  research memory agent, autonomous literature review, local AI researcher
 -->

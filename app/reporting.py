@@ -7,6 +7,102 @@ from pydantic import BaseModel, Field
 from . import config as cfg
 from .services import ollama_generate
 
+try:
+    import chromadb
+except Exception:  # pragma: no cover
+    chromadb = None
+
+try:
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction as _STEmbedFn
+except Exception:  # pragma: no cover
+    _STEmbedFn = None
+
+
+def _best_embedding_device() -> str:
+    """Return the best available device for sentence-transformer embeddings."""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+class _FactStore:
+    """
+    Transient in-memory vector store for extracted facts.
+
+    Splits each source extract into individual bullet-point facts, embeds them
+    via ChromaDB's default sentence-transformer, and allows semantic retrieval
+    per criterion. Falls back to regex Q-label matching when ChromaDB is unavailable.
+    """
+
+    def __init__(self, extracts: list[str]) -> None:
+        self._extracts = extracts
+        self._collection: Any | None = None
+        self._available = False
+        if chromadb is None or not extracts:
+            return
+        try:
+            client = chromadb.Client()
+            embed_kwargs: dict[str, Any] = {"metadata": {"hnsw:space": "cosine"}}
+            if _STEmbedFn is not None:
+                device = _best_embedding_device()
+                try:
+                    embed_kwargs["embedding_function"] = _STEmbedFn(
+                        model_name="all-MiniLM-L6-v2",
+                        device=device,
+                    )
+                except Exception:
+                    pass  # fall back to ChromaDB default (onnxruntime on CPU)
+            col = client.create_collection(name="facts", **embed_kwargs)
+            docs: list[str] = []
+            ids: list[str] = []
+            idx = 0
+            for ei, extract in enumerate(extracts):
+                for line in extract.splitlines():
+                    stripped = line.strip().lstrip("-•* ")
+                    if len(stripped) > 20 and not stripped.upper().startswith(("Q", "OTHER RELEVANT", "SOURCE")):
+                        docs.append(stripped)
+                        ids.append(f"f_{ei}_{idx}")
+                        idx += 1
+                    elif len(stripped) > 20:
+                        docs.append(stripped)
+                        ids.append(f"f_{ei}_{idx}")
+                        idx += 1
+            if docs:
+                col.add(documents=docs, ids=ids)
+                self._collection = col
+                self._available = True
+        except Exception:
+            pass
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def query(self, criterion: str, n_results: int = 30) -> str:
+        """Retrieve the most relevant facts for a given criterion."""
+        if not self._available or not self._collection:
+            return ""
+        try:
+            results = self._collection.query(
+                query_texts=[criterion],
+                n_results=min(n_results, self._collection.count()),
+            )
+            docs = results.get("documents", [[]])[0]
+            return "\n".join(f"- {d}" for d in docs if d.strip())
+        except Exception:
+            return ""
+
+    def query_all(self, criterion: str, n_results: int = 30) -> tuple[str, str]:
+        """Return (relevant_text, other_context) for a criterion."""
+        relevant = self.query(criterion, n_results)
+        return relevant, ""
+
 
 class ReportFinding(BaseModel):
     id: str
@@ -593,50 +689,57 @@ async def _synthesize_final(
         except Exception:
             return f"# {task_text}\n\n" + all_extracts
 
-    # ── Write each criterion section with its own dedicated agent ──
+    # ── Build semantic fact store (ChromaDB) or fall back to regex matching ──
+    fact_store = _FactStore(extracts)
+    retrieval_mode = "chromadb" if fact_store.available else "regex"
+
     section_markdowns: list[str] = []
     section_summaries: list[str] = []
 
     for i, criterion in enumerate(criteria):
         section_title = criterion[:120].rstrip(".,")
 
-        # Filter extracts to find facts relevant to this criterion
-        q_label = f"Q{i+1}"
-        relevant_parts: list[str] = []
-        other_parts: list[str] = []
-        for extract in extracts:
-            lines = extract.splitlines()
-            relevant_lines = []
-            other_lines = []
-            in_relevant = False
-            for line in lines:
-                if line.strip().upper().startswith(f"{q_label} FACTS") or line.strip().upper().startswith(f"{q_label}:"):
-                    in_relevant = True
-                    continue
-                elif re.match(r"^Q\d+ (FACTS|:)", line.strip(), re.I):
-                    in_relevant = False
-                elif line.strip().upper().startswith("OTHER RELEVANT"):
-                    in_relevant = False
-
-                if in_relevant and line.strip() and line.strip() != "- NONE":
-                    relevant_lines.append(line)
-                elif line.strip() and line.strip() != "- NONE":
-                    other_lines.append(line)
-
-            if relevant_lines:
-                relevant_parts.append("\n".join(relevant_lines))
-            if other_lines:
-                other_parts.append("\n".join(other_lines))
-
-        # If we couldn't filter, use all extracts
-        if not relevant_parts:
-            extracts_for_section = all_extracts[:8000]
+        if fact_store.available:
+            # Semantic retrieval: query ChromaDB with the criterion text
+            extracts_for_section = fact_store.query(criterion, n_results=40)
+            if len(extracts_for_section) < 100:
+                extracts_for_section = all_extracts[:8000]
         else:
-            extracts_for_section = "\n\n".join(relevant_parts)
-            # Add some "other" context too
-            other_text = "\n".join(other_parts)[:2000]
-            if other_text:
-                extracts_for_section += f"\n\nADDITIONAL CONTEXT:\n{other_text}"
+            # Regex fallback: match by Q-label structure from extractor output
+            q_label = f"Q{i+1}"
+            relevant_parts: list[str] = []
+            other_parts: list[str] = []
+            for extract in extracts:
+                lines = extract.splitlines()
+                relevant_lines: list[str] = []
+                other_lines: list[str] = []
+                in_relevant = False
+                for line in lines:
+                    if line.strip().upper().startswith(f"{q_label} FACTS") or line.strip().upper().startswith(f"{q_label}:"):
+                        in_relevant = True
+                        continue
+                    elif re.match(r"^Q\d+ (FACTS|:)", line.strip(), re.I):
+                        in_relevant = False
+                    elif line.strip().upper().startswith("OTHER RELEVANT"):
+                        in_relevant = False
+
+                    if in_relevant and line.strip() and line.strip() != "- NONE":
+                        relevant_lines.append(line)
+                    elif line.strip() and line.strip() != "- NONE":
+                        other_lines.append(line)
+
+                if relevant_lines:
+                    relevant_parts.append("\n".join(relevant_lines))
+                if other_lines:
+                    other_parts.append("\n".join(other_lines))
+
+            if not relevant_parts:
+                extracts_for_section = all_extracts[:8000]
+            else:
+                extracts_for_section = "\n\n".join(relevant_parts)
+                other_text = "\n".join(other_parts)[:2000]
+                if other_text:
+                    extracts_for_section += f"\n\nADDITIONAL CONTEXT:\n{other_text}"
 
         # Extract analysis relevant to this criterion
         analysis_for_section = ""
@@ -660,7 +763,7 @@ async def _synthesize_final(
         if progress_callback:
             await progress_callback(
                 f"[SECTION {i+1}/{len(criteria)}] Writing: {section_title[:60]}",
-                f"Relevant facts: {len(extracts_for_section)} chars | Analysis: {len(analysis_for_section)} chars"
+                f"Facts: {len(extracts_for_section)} chars ({retrieval_mode}) | Analysis: {len(analysis_for_section)} chars"
             )
 
         section_md = await _write_section(

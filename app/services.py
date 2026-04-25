@@ -252,15 +252,60 @@ async def fetch_browser(url: str, timeout_sec: int) -> FetchResult:
         return FetchResult(False, None, None, "failed", "playwright_not_available", fetch_method="browser")
 
 
-def extract_content(html: str, task_text: str, query_text: str | None, fallback_title: str | None = None) -> dict[str, Any]:
-    if trafilatura:
-        text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
-        meta = trafilatura.extract_metadata(html)
-        title = (meta.title if meta and meta.title else None) or fallback_title or "Untitled"
-    else:
-        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
-        title = fallback_title or "Untitled"
+def _trafilatura_extract(html: str, fallback_title: str | None = None) -> tuple[str, str]:
+    """Extract text and title using trafilatura (markdown output for richer structure)."""
+    if not trafilatura:
+        return "", fallback_title or "Untitled"
+    text = trafilatura.extract(
+        html,
+        include_comments=False,
+        include_tables=True,
+        include_links=False,
+        output_format="markdown",
+        favor_recall=True,
+    ) or ""
+    meta = trafilatura.extract_metadata(html)
+    title = (meta.title if meta and meta.title else None) or fallback_title or "Untitled"
+    return text, title
 
+
+def _regex_extract(html: str, fallback_title: str | None = None) -> tuple[str, str]:
+    """Bare-minimum regex fallback when trafilatura isn't available."""
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+    return text, fallback_title or "Untitled"
+
+
+async def fetch_jina_reader(url: str, timeout_sec: int = 30) -> tuple[str, str]:
+    """
+    Jina Reader API — free fallback content extractor.
+    Prepend r.jina.ai/ to any URL and get clean markdown.
+    Free tier: 20 RPM without API key.
+    """
+    jina_url = f"https://r.jina.ai/{url}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
+            resp = await client.get(jina_url, headers={"Accept": "text/markdown"})
+            if resp.status_code == 200 and len(resp.text.strip()) > 100:
+                lines = resp.text.strip().splitlines()
+                title = "Untitled"
+                text_lines = []
+                for line in lines:
+                    if line.startswith("Title:") and title == "Untitled":
+                        title = line[6:].strip() or "Untitled"
+                    elif line.startswith("URL:") or line.startswith("Published Time:"):
+                        continue
+                    else:
+                        text_lines.append(line)
+                return "\n".join(text_lines).strip(), title
+    except Exception:
+        pass
+    return "", "Untitled"
+
+
+def _score_extraction(
+    text: str, title: str, task_text: str, query_text: str | None,
+) -> dict[str, Any]:
+    """Score extracted content for relevance and quality."""
     text_len = len(text.strip())
     task_terms = {t.lower() for t in re.findall(r"[a-zA-Z]{4,}", task_text)}
     query_terms = {t.lower() for t in re.findall(r"[a-zA-Z]{4,}", query_text or "")}
@@ -297,6 +342,17 @@ def extract_content(html: str, task_text: str, query_text: str | None, fallback_
             "score": score,
         },
     }
+
+
+def extract_content(html: str, task_text: str, query_text: str | None, fallback_title: str | None = None) -> dict[str, Any]:
+    """
+    Primary extraction: trafilatura (markdown mode for richer output).
+    Falls back to regex strip if trafilatura isn't installed.
+    """
+    text, title = _trafilatura_extract(html, fallback_title)
+    if not text.strip():
+        text, title = _regex_extract(html, fallback_title)
+    return _score_extraction(text, title, task_text, query_text)
 
 
 def should_retry_with_browser(fetch_result: FetchResult, extraction: dict[str, Any] | None) -> tuple[bool, str]:
@@ -644,3 +700,493 @@ async def autonomous_step(
         "queries": queries[:4],
         "raw": output[:1500],
     }
+
+
+# ────────────────────────────────────────────────────────
+#  New autonomous loop agents (modular cognition)
+#
+#  Each agent is a standalone expert with zero awareness of
+#  the pipeline or other agents.  The orchestrator in
+#  pipeline.py handles wiring, parsing, and memory updates.
+# ────────────────────────────────────────────────────────
+
+def _parse_sections(text: str, header_map: dict[str, str], primary_key: str) -> dict[str, str]:
+    """
+    Generic section parser reused across all agents.
+
+    Splits LLM output into named sections using flexible header matching.
+    Falls back to treating the entire output as the primary section.
+    """
+    sections: dict[str, str] = {}
+    current_key = "_preamble"
+    current_lines: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        matched = False
+        for header, section_name in header_map.items():
+            if upper.startswith(header + ":") or upper.startswith(header + " :"):
+                sections[current_key] = "\n".join(current_lines).strip()
+                current_key = section_name
+                colon_pos = stripped.find(":")
+                rest = stripped[colon_pos + 1:].strip() if colon_pos >= 0 else ""
+                current_lines = [rest] if rest else []
+                matched = True
+                break
+        if not matched:
+            current_lines.append(line)
+    sections[current_key] = "\n".join(current_lines).strip()
+
+    if not sections.get(primary_key, "").strip():
+        full = text.strip()
+        if full:
+            sections[primary_key] = full
+
+    return sections
+
+
+def _extract_queries_from_text(text: str, search_history: list[str] | None = None) -> list[str]:
+    """Extract QUERY: lines from agent output, clean and dedup."""
+    queries: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        raw = re.sub(r"^QUERY\s*:\s*", "", stripped, flags=re.I)
+        raw = re.sub(r"^[-*•·]\s*", "", raw)
+        q = _clean_query(raw)
+        if 5 <= len(q) <= 200:
+            queries.append(q)
+    if search_history:
+        seen = {h.lower() for h in search_history}
+        queries = [q for q in queries if q.lower() not in seen]
+    return queries
+
+
+async def analyze_round(
+    task_text: str,
+    goal: str,
+    criteria: list[str],
+    working_thesis: str,
+    previous_insights: str,
+    new_sources_content: str,
+    base_url: str,
+    model: str,
+) -> dict[str, Any]:
+    """
+    The Forensic Analyst — reads new documents and writes up what they mean.
+
+    Returns dict with keys: findings, surprises, contradictions, open_questions, raw.
+    """
+    criteria_text = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(criteria))
+
+    prompt = (
+        "You are a meticulous research analyst. You have been given a set of documents "
+        "to review alongside what is already known about this topic.\n\n"
+        f"RESEARCH QUESTION: {task_text}\n"
+        f"WHAT WE ARE INVESTIGATING:\n{criteria_text}\n\n"
+        f"WHAT IS CURRENTLY BELIEVED:\n{working_thesis or 'No beliefs formed yet.'}\n\n"
+        f"WHAT WAS ALREADY KNOWN:\n{previous_insights or 'Nothing yet — this is the first round.'}\n\n"
+        f"NEW DOCUMENTS TO ANALYZE:\n{new_sources_content}\n\n"
+        "Read every document carefully. Then write your analysis:\n\n"
+        "FINDINGS:\n"
+        "For each research question these documents address:\n"
+        "- Question N: [what specific new facts or evidence you found]\n"
+        "  Source: [which document — and rate it PRIMARY/SECONDARY/TERTIARY]\n\n"
+        "SURPRISES:\n"
+        "Anything that contradicts the current beliefs or introduces something new?\n"
+        "- [unexpected findings, or NONE]\n\n"
+        "CONTRADICTIONS:\n"
+        "Does anything conflict with what was already known? Which source is more credible?\n"
+        "- [conflicts with credibility comparison, or NONE]\n\n"
+        "OPEN QUESTIONS:\n"
+        "What would you want to look into next based on what you just read?\n"
+        "- [questions that arose from this analysis]\n"
+    )
+
+    header_map = {
+        "FINDINGS": "findings", "FINDING": "findings", "RESULTS": "findings",
+        "SURPRISES": "surprises", "SURPRISE": "surprises", "UNEXPECTED": "surprises",
+        "CONTRADICTIONS": "contradictions", "CONTRADICTION": "contradictions",
+        "CONFLICTS": "contradictions", "CONFLICT": "contradictions",
+        "OPEN QUESTIONS": "open_questions", "QUESTIONS": "open_questions",
+        "OPEN": "open_questions", "NEXT": "open_questions",
+    }
+
+    try:
+        output = await ollama_generate(
+            prompt, base_url, model,
+            timeout=cfg.ANALYSIS_ROUND_TIMEOUT,
+            max_tokens=cfg.ANALYSIS_ROUND_MAX_TOKENS,
+            temperature=cfg.ANALYSIS_ROUND_TEMPERATURE,
+        )
+    except Exception:
+        return {"findings": "", "surprises": "", "contradictions": "", "open_questions": "", "raw": ""}
+
+    sections = _parse_sections(output, header_map, "findings")
+
+    credibility: dict[str, int] = {}
+    for m in re.finditer(r"(PRIMARY|SECONDARY|TERTIARY)", sections.get("findings", ""), re.I):
+        key = m.group(0).upper()
+        credibility[key] = credibility.get(key, 0) + 1
+
+    return {
+        "findings": sections.get("findings", ""),
+        "surprises": sections.get("surprises", ""),
+        "contradictions": sections.get("contradictions", ""),
+        "open_questions": sections.get("open_questions", ""),
+        "credibility_counts": credibility,
+        "raw": output[:2000],
+    }
+
+
+async def reflect_and_reason(
+    task_text: str,
+    goal: str,
+    plan_steps: str,
+    criteria_with_confidence: str,
+    working_thesis: str,
+    all_insights: str,
+    credibility_summary: str,
+    search_history_text: str,
+    base_url: str,
+    model: str,
+) -> dict[str, Any]:
+    """
+    The Senior Scientist — steps back and thinks about the big picture.
+
+    Returns dict with keys: beliefs, confidence, critique, gaps, implications, decision, reasoning, raw.
+    """
+    prompt = (
+        "You are a senior scientist reviewing the current state of a research project. "
+        "Step back from the details and think about the big picture.\n\n"
+        f"ORIGINAL QUESTION: {task_text}\n"
+        f"RESEARCH OBJECTIVE: {goal}\n"
+        f"RESEARCH PLAN:\n{plan_steps}\n\n"
+        f"RESEARCH QUESTIONS AND CURRENT CONFIDENCE:\n{criteria_with_confidence}\n\n"
+        f"CURRENT BELIEFS (what the evidence suggests so far):\n{working_thesis or 'No beliefs formed yet.'}\n\n"
+        f"ALL FINDINGS TO DATE:\n{all_insights or 'No findings yet.'}\n\n"
+        f"SOURCE QUALITY DISTRIBUTION:\n{credibility_summary or 'No sources rated yet.'}\n\n"
+        f"SEARCHES CONDUCTED:\n{search_history_text or '(none yet)'}\n\n"
+        "As the senior advisor on this project, provide your assessment:\n\n"
+        "UPDATED BELIEFS:\n"
+        "For each research question, state in 1-2 sentences what the evidence currently "
+        "points to. Be concrete — \"evidence suggests X because Y, though Z remains "
+        "uncertain\" — not \"more data needed.\"\n\n"
+        "CONFIDENCE:\n"
+        "For each research question: LOW / MEDIUM / HIGH\n"
+        "Consider: How many independent sources agree? How credible are they? Do we have "
+        "ONLY confirming evidence (suspicious) or also disconfirming evidence that we've "
+        "addressed? Is the evidence specific or vague?\n\n"
+        "HONEST CRITIQUE:\n"
+        "Be brutally honest about this research:\n"
+        "- Are we only finding what we expect to find?\n"
+        "- What is the most obvious thing a domain expert would say we're missing?\n"
+        "- Are we relying on weak sources for strong claims?\n"
+        "- Are we asking the right questions, or just the easy ones?\n\n"
+        "GAPS:\n"
+        "What specific information — concrete facts, data points, expert perspectives — "
+        "would make this research substantially more valuable?\n\n"
+        "IMPLICATIONS:\n"
+        f"For each well-supported finding, what does it actually mean for someone who "
+        f"asked \"{task_text[:120]}\"? Connect the evidence to practical reality.\n\n"
+        "VERDICT: CONTINUE or STOP\n"
+        "STOP only if: the majority of questions have HIGH confidence, key claims are "
+        "supported by credible sources, and you genuinely believe more searching will "
+        "not materially improve the answer.\n"
+        "REASONING: [why]\n"
+    )
+
+    header_map = {
+        "UPDATED BELIEFS": "beliefs", "BELIEFS": "beliefs", "UPDATED": "beliefs",
+        "CONFIDENCE": "confidence",
+        "HONEST CRITIQUE": "critique", "CRITIQUE": "critique", "CRITICISM": "critique",
+        "SELF-CRITIQUE": "critique",
+        "GAPS": "gaps", "GAP": "gaps", "MISSING": "gaps", "MISSING PIECES": "gaps",
+        "IMPLICATIONS": "implications", "IMPLICATION": "implications",
+        "SO WHAT": "implications",
+        "VERDICT": "decision", "DECISION": "decision",
+        "REASONING": "reasoning", "REASON": "reasoning",
+    }
+
+    try:
+        output = await ollama_generate(
+            prompt, base_url, model,
+            timeout=cfg.REFLECT_TIMEOUT,
+            max_tokens=cfg.REFLECT_MAX_TOKENS,
+            temperature=cfg.REFLECT_TEMPERATURE,
+        )
+    except Exception:
+        return {
+            "beliefs": "", "confidence": "", "critique": "", "gaps": "",
+            "implications": "", "decision": "CONTINUE", "reasoning": "", "raw": "",
+        }
+
+    sections = _parse_sections(output, header_map, "beliefs")
+
+    decision_raw = (sections.get("decision", "") + " " + sections.get("reasoning", "")).upper()
+    decision = "STOP" if "STOP" in decision_raw else "CONTINUE"
+
+    return {
+        "beliefs": sections.get("beliefs", ""),
+        "confidence": sections.get("confidence", ""),
+        "critique": sections.get("critique", ""),
+        "gaps": sections.get("gaps", ""),
+        "implications": sections.get("implications", ""),
+        "decision": decision,
+        "reasoning": sections.get("reasoning", ""),
+        "raw": output[:2000],
+    }
+
+
+async def challenge_beliefs(
+    task_text: str,
+    working_thesis_and_claims: str,
+    base_url: str,
+    model: str,
+) -> dict[str, Any]:
+    """
+    The Skeptical Reviewer — tears apart claims to find weaknesses.
+
+    Returns dict with keys: weaknesses, alternatives, blind_spots, queries, raw.
+    """
+    prompt = (
+        "You are a rigorous peer reviewer. You have been given a set of claims from a "
+        "research paper. Your job is to find every weakness, every assumption, every "
+        "alternative explanation the authors may have missed.\n\n"
+        f"THE PAPER'S RESEARCH QUESTION: {task_text}\n\n"
+        f"CLAIMS BEING MADE:\n{working_thesis_and_claims}\n\n"
+        "For each claim, provide your review:\n\n"
+        "WEAKNESSES:\n"
+        "- Claim: [restate it]\n"
+        "  Best counter-argument: [the strongest case AGAINST this claim]\n"
+        "  What would disprove it: [what evidence, if found, would invalidate this]\n"
+        "  Search suggestion: [3-7 word query to find such evidence]\n\n"
+        "ALTERNATIVE READINGS:\n"
+        "Could the same evidence support a DIFFERENT conclusion? What else could "
+        "explain what was observed?\n"
+        "- [alternative interpretation of the evidence]\n\n"
+        "BLIND SPOTS:\n"
+        "Whose perspective is missing from this analysis? What stakeholder, expert "
+        "community, or contrarian viewpoint has not been considered?\n"
+        "- [missing perspective and why it matters]\n\n"
+        "DISCONFIRMING SEARCHES:\n"
+        "1-3 search queries specifically designed to find evidence that would weaken "
+        "or disprove the strongest claims. Frame these as a skeptic would — look for "
+        "failures, criticisms, risks, exceptions, counterexamples.\n"
+        "- QUERY: [3-7 words]\n"
+        "  CHALLENGES: [which claim this would test]\n"
+    )
+
+    header_map = {
+        "WEAKNESSES": "weaknesses", "WEAKNESS": "weaknesses",
+        "ALTERNATIVE READINGS": "alternatives", "ALTERNATIVES": "alternatives",
+        "ALTERNATIVE": "alternatives",
+        "BLIND SPOTS": "blind_spots", "BLIND SPOT": "blind_spots",
+        "MISSING PERSPECTIVES": "blind_spots",
+        "DISCONFIRMING SEARCHES": "queries", "DISCONFIRMING": "queries",
+        "SEARCH QUERIES": "queries", "QUERIES": "queries",
+    }
+
+    try:
+        output = await ollama_generate(
+            prompt, base_url, model,
+            timeout=cfg.CHALLENGE_TIMEOUT,
+            max_tokens=cfg.CHALLENGE_MAX_TOKENS,
+            temperature=cfg.CHALLENGE_TEMPERATURE,
+        )
+    except Exception:
+        return {"weaknesses": "", "alternatives": "", "blind_spots": "", "queries": [], "raw": ""}
+
+    sections = _parse_sections(output, header_map, "weaknesses")
+
+    queries_text = sections.get("queries", "")
+    parsed_queries: list[dict[str, str]] = []
+    current_query = ""
+    current_challenge = ""
+    for line in queries_text.splitlines():
+        stripped = line.strip()
+        q_match = re.match(r"^(?:QUERY\s*:\s*|[-*•]\s*QUERY\s*:\s*)(.*)", stripped, re.I)
+        c_match = re.match(r"^(?:CHALLENGES?\s*:\s*|[-*•]\s*CHALLENGES?\s*:\s*)(.*)", stripped, re.I)
+        if q_match:
+            if current_query:
+                parsed_queries.append({"query": _clean_query(current_query), "challenges": current_challenge})
+            current_query = q_match.group(1).strip()
+            current_challenge = ""
+        elif c_match:
+            current_challenge = c_match.group(1).strip()
+        elif not q_match and not c_match and stripped:
+            q = _clean_query(stripped)
+            if 5 <= len(q) <= 200:
+                current_query = q
+    if current_query:
+        parsed_queries.append({"query": _clean_query(current_query), "challenges": current_challenge})
+
+    parsed_queries = [p for p in parsed_queries if p["query"] and len(p["query"]) >= 5]
+
+    return {
+        "weaknesses": sections.get("weaknesses", ""),
+        "alternatives": sections.get("alternatives", ""),
+        "blind_spots": sections.get("blind_spots", ""),
+        "queries": parsed_queries[:3],
+        "raw": output[:2000],
+    }
+
+
+async def discover_new_angles(
+    task_text: str,
+    criteria: list[str],
+    all_insights: str,
+    all_surprises: str,
+    base_url: str,
+    model: str,
+) -> dict[str, Any]:
+    """
+    The Pattern Spotter — finds hidden connections and missing angles.
+
+    Returns dict with keys: patterns, missing, new_directions, raw.
+    """
+    criteria_text = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(criteria))
+
+    prompt = (
+        "You are an interdisciplinary researcher known for spotting patterns others miss. "
+        "You have been given the accumulated findings from a research project and asked "
+        "to look at them with fresh eyes.\n\n"
+        f"ORIGINAL QUESTION: {task_text}\n"
+        f"CURRENT RESEARCH AREAS:\n{criteria_text}\n\n"
+        f"ALL FINDINGS:\n{all_insights}\n\n"
+        f"UNEXPECTED OBSERVATIONS:\n{all_surprises or 'None so far.'}\n\n"
+        "Look at everything together — not one area at a time, but ALL of it at once.\n\n"
+        "PATTERNS:\n"
+        "What threads run ACROSS different research areas? When findings from Area A "
+        "and Area B are placed side by side, what emerges? What topics keep showing up "
+        "that are NOT in the research areas?\n"
+        "- [pattern and what it implies]\n\n"
+        "MISSING:\n"
+        "If a leading expert in this domain read these findings, what would they say "
+        "is obviously missing? What adjacent fields could shed light?\n"
+        "- [what's missing and why it matters]\n\n"
+        "NEW DIRECTIONS:\n"
+        "0-3 new research areas to explore. Only suggest if genuinely distinct from "
+        "existing areas AND supported by patterns in the findings. Write NONE if the "
+        "current areas are sufficient.\n"
+        "- [new direction and evidence for it]\n"
+    )
+
+    header_map = {
+        "PATTERNS": "patterns", "PATTERN": "patterns",
+        "HIDDEN CONNECTIONS": "patterns", "CONNECTIONS": "patterns",
+        "MISSING": "missing", "GAPS": "missing", "BLIND SPOTS": "missing",
+        "NEW DIRECTIONS": "new_directions", "NEW DIRECTION": "new_directions",
+        "SUGGESTED": "new_directions", "SUGGESTIONS": "new_directions",
+    }
+
+    try:
+        output = await ollama_generate(
+            prompt, base_url, model,
+            timeout=cfg.DISCOVER_TIMEOUT,
+            max_tokens=cfg.DISCOVER_MAX_TOKENS,
+            temperature=cfg.DISCOVER_TEMPERATURE,
+        )
+    except Exception:
+        return {"patterns": [], "missing": "", "new_directions": [], "raw": ""}
+
+    sections = _parse_sections(output, header_map, "patterns")
+
+    patterns = [
+        line.strip().lstrip("-*• ") for line in sections.get("patterns", "").splitlines()
+        if line.strip() and len(line.strip()) > 15 and not line.strip().upper().startswith("NONE")
+    ]
+
+    new_dirs_raw = sections.get("new_directions", "")
+    new_directions = []
+    if "NONE" not in new_dirs_raw.upper()[:20]:
+        for line in new_dirs_raw.splitlines():
+            cleaned = line.strip().lstrip("-*• ")
+            if len(cleaned) > 15:
+                new_directions.append(cleaned)
+
+    return {
+        "patterns": patterns[:5],
+        "missing": sections.get("missing", ""),
+        "new_directions": new_directions[:3],
+        "raw": output[:2000],
+    }
+
+
+async def strategize_next_move(
+    goal: str,
+    task_text: str,
+    gaps: str,
+    challenge_items: str,
+    new_angles: str,
+    search_history: list[str],
+    phase: str,
+    base_url: str,
+    model: str,
+) -> dict[str, Any]:
+    """
+    The Search Strategist — produces the best search queries for the next round.
+
+    Returns dict with keys: queries (list[str]), raw.
+    """
+    history_text = "\n".join(f"  - {q}" for q in search_history[-40:]) if search_history else "  (none yet)"
+
+    prompt = (
+        "You are an intelligence analyst planning the next round of information "
+        "gathering. You need to find specific information to fill gaps in an "
+        "ongoing investigation.\n\n"
+        f"OBJECTIVE: {goal}\n\n"
+        f"INFORMATION GAPS (areas where evidence is thin or missing):\n{gaps or '(no specific gaps identified)'}\n\n"
+        f"CLAIMS TO STRESS-TEST (look for evidence AGAINST these):\n{challenge_items or '(none)'}\n\n"
+        f"NEW LEADS TO FOLLOW:\n{new_angles or '(none)'}\n\n"
+        f"ALREADY SEARCHED (do NOT repeat these or close variants):\n{history_text}\n\n"
+        f"CURRENT PHASE: {phase}\n"
+        "- EARLY (building initial understanding): Broad, diverse queries. Cover as much ground as possible.\n"
+        "- MIDDLE (filling specific gaps): Precise, targeted queries. Drill into weak areas.\n"
+        "- LATE (stress-testing conclusions): Look for contradictions, critiques, failures, exceptions.\n\n"
+        f"The person who needs this information specifically asked: \"{task_text[:150]}\"\n"
+        "Every query should ultimately serve their needs.\n\n"
+        "Produce 3-5 queries, one per line:\n"
+        "QUERY: [3-7 words, suitable for a web search engine]\n"
+        "TARGET: [which gap or claim this addresses]\n"
+    )
+
+    try:
+        output = await ollama_generate(
+            prompt, base_url, model,
+            timeout=cfg.STRATEGY_TIMEOUT,
+            max_tokens=cfg.STRATEGY_MAX_TOKENS,
+            temperature=cfg.STRATEGY_TEMPERATURE,
+        )
+    except Exception:
+        return {"queries": [], "raw": ""}
+
+    queries = _extract_queries_from_text(output, search_history)
+
+    if len(queries) < 2:
+        for line in output.splitlines():
+            q = _clean_query(line.strip())
+            if 5 <= len(q) <= 200 and q not in queries:
+                queries.append(q)
+            if len(queries) >= 4:
+                break
+
+    if search_history:
+        seen = {h.lower() for h in search_history}
+        queries = [q for q in queries if q.lower() not in seen]
+
+    return {"queries": queries[:5], "raw": output[:1500]}
+
+
+def _criteria_to_initial_queries(criteria: list[str], task_text: str) -> list[str]:
+    """Generate initial search queries from plan criteria for iteration 1 bootstrap."""
+    queries: list[str] = []
+    for criterion in criteria[:5]:
+        kw = _extract_keywords(criterion, max_words=5)
+        if kw and len(kw) >= 5:
+            queries.append(kw)
+    if not queries:
+        queries = [_extract_keywords(task_text, max_words=5)]
+    return queries[:4]
