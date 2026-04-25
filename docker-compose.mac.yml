@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Apple Silicon (MPS) override
+#
+#  Ollama running inside a Docker container on macOS cannot access the host's
+#  GPU — Docker on Mac runs inside a Linux VM with no MPS passthrough.
+#
+#  This override removes the Docker Ollama service entirely and points the app
+#  to Ollama running *natively* on the host, which uses Metal/MPS automatically.
+#
+#  Usage:
+#    1. Start Ollama natively:
+#         ollama serve                 # or open Ollama.app
+#    2. Pull the model you want:
+#         ollama pull llama3.1:8b
+#    3. Start only the app container:
+#         docker compose -f docker-compose.yml -f docker-compose.mac.yml up --build -d
+#
+#  The app will connect to your host Ollama at http://host.docker.internal:11434
+#  and inference will run fully on Apple Silicon (MPS).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  ollama:
+    # Disable the bundled Ollama container — use host Ollama instead
+    profiles: ["disabled"]
+
+  local-research-agent:
+    environment:
+      # Points to native Ollama on the Mac host
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Remove the healthy-ollama dependency since we manage it ourselves
+    depends_on: []

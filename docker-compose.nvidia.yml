@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  NVIDIA GPU override
+#
+#  Passes an NVIDIA GPU into the Ollama container so inference runs on CUDA
+#  instead of CPU.
+#
+#  Requirements:
+#    - NVIDIA drivers installed on the host
+#    - nvidia-container-toolkit installed:
+#        https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#    - Docker configured to use the NVIDIA runtime
+#
+#  Usage:
+#    docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up --build -d
+#
+#  Verify GPU is being used after startup:
+#    docker exec lra-ollama nvidia-smi
+#    docker exec lra-ollama ollama ps       # should show GPU memory used
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # Force Ollama to use CUDA (default behaviour when GPU is present, but explicit is safer)
+      OLLAMA_GPU_OVERHEAD: "0"
